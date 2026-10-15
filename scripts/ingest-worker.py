@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from haystack.dataclasses import Breakpoint
+from haystack.core.errors import BreakpointException
+
+from rag3.checkpoint import CheckpointIdentity, CheckpointStore, PIPELINE_SCHEMA_VERSION
+from rag3.haystack_native import (
+    DEFAULT_NATIVE_COLLECTION,
+    DEFAULT_SPLIT_LENGTH,
+    DEFAULT_SPLIT_OVERLAP,
+    build_ingestion_pipeline,
+    create_document_store,
+    find_bge_m3,
+    preserve_source,
+)
+
+
+def emit(kind: str, **payload) -> None:
+    print(json.dumps({"type": kind, **payload}, ensure_ascii=False), flush=True)
+
+
+def pause_request_path(source_sha: str) -> Path:
+    return ROOT / "data" / "checkpoints" / source_sha / "pause.request"
+
+
+def checkpoint_identity(source_sha: str, model_path: str, collection: str) -> CheckpointIdentity:
+    return CheckpointIdentity(
+        source_sha256=source_sha,
+        pipeline_schema_version=PIPELINE_SCHEMA_VERSION,
+        split_length=DEFAULT_SPLIT_LENGTH,
+        split_overlap=DEFAULT_SPLIT_OVERLAP,
+        embedding_model=model_path,
+        target_collection=collection,
+    )
+
+
+def checkpoint_callback(store: CheckpointStore, identity: CheckpointIdentity):
+    def _save(snapshot):
+        saved = store.save_snapshot(snapshot, identity=identity, state="RUNNING")
+        emit("log", message=f"CHECKPOINT_SAVED {snapshot.break_point.component_name}")
+        return saved
+    return _save
+
+
+def should_pause(source_sha: str) -> bool:
+    return pause_request_path(source_sha).exists()
+
+
+def clear_pause(source_sha: str) -> None:
+    pause_request_path(source_sha).unlink(missing_ok=True)
+
+
+def pause_if_requested(store: CheckpointStore, identity: CheckpointIdentity, source_sha: str) -> bool:
+    if not should_pause(source_sha):
+        return False
+    clear_pause(source_sha)
+    store.set_state("PAUSED", identity=identity)
+    emit("paused", source_sha256=source_sha)
+    return True
+
+
+def run_to_breakpoint(pipe, *, data, snapshot, component: str, callback):
+    try:
+        if snapshot is None:
+            pipe.run(
+                data,
+                break_point=Breakpoint(component_name=component),
+                snapshot_callback=callback,
+            )
+        else:
+            pipe.run(
+                {},
+                pipeline_snapshot=snapshot,
+                break_point=Breakpoint(component_name=component),
+                snapshot_callback=callback,
+            )
+    except BreakpointException:
+        return
+    raise RuntimeError(f"Expected breakpoint before {component} was not reached")
+
+
+def run_job(source: Path, collection: str, mode: str) -> dict:
+    preserved = preserve_source(source)
+    source_sha = preserved["source_sha256"]
+    model_path = str(find_bge_m3())
+    identity = checkpoint_identity(source_sha, model_path, collection)
+    checkpoints = CheckpointStore(source_sha)
+    clear_pause(source_sha)
+
+    if mode == "restart":
+        checkpoints.discard_processing_state()
+
+    store = create_document_store(collection=collection, recreate_index=False)
+    pipe = build_ingestion_pipeline(document_store=store, model_path=model_path)
+    cb = checkpoint_callback(checkpoints, identity)
+
+    base_meta = {
+        "document_id": preserved["document_id"],
+        "title": preserved["title"],
+        "source_uri": preserved["source_uri"],
+        "source_sha256": source_sha,
+        "page_start": None,
+        "page_end": None,
+        "section_path": [],
+        "content_type": "prose",
+        "document_version": "1",
+    }
+    data = {
+        "converter": {
+            "sources": [str(preserved["managed_source"])],
+            "meta": base_meta,
+        }
+    }
+
+    if mode == "resume":
+        emit("log", message="STAGE resume RUN")
+        snapshot = checkpoints.load_snapshot(identity)
+    else:
+        emit("log", message="STAGE parse RUN")
+        run_to_breakpoint(pipe, data=data, snapshot=None, component="embedder", callback=cb)
+        emit("log", message="STAGE parse PASS")
+        emit("log", message="STAGE chunk PASS")
+        if pause_if_requested(checkpoints, identity, source_sha):
+            return {"status": "PAUSED", "source_sha256": source_sha}
+        snapshot = checkpoints.load_snapshot(identity)
+
+    if snapshot.break_point.component_name == "embedder":
+        emit("log", message="STAGE embedding RUN")
+        run_to_breakpoint(pipe, data={}, snapshot=snapshot, component="writer", callback=cb)
+        emit("log", message="STAGE embedding PASS")
+        if pause_if_requested(checkpoints, identity, source_sha):
+            return {"status": "PAUSED", "source_sha256": source_sha}
+        snapshot = checkpoints.load_snapshot(identity)
+
+    emit("log", message="STAGE qdrant RUN")
+    result = pipe.run({}, pipeline_snapshot=snapshot, snapshot_callback=cb)
+    count_after = store.count_documents()
+    written = result.get("writer", {}).get("documents_written")
+    if count_after < 1 or written is None:
+        raise RuntimeError("Final Qdrant verification failed")
+
+    checkpoints.set_state("COMPLETE", identity=identity)
+    emit("log", message="STAGE qdrant PASS")
+    return {
+        "status": "COMPLETE",
+        "source_sha256": source_sha,
+        "managed_source": str(preserved["managed_source"]),
+        "collection": collection,
+        "documents_written": written,
+        "count_after": count_after,
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("document")
+    ap.add_argument("--collection", default=DEFAULT_NATIVE_COLLECTION)
+    ap.add_argument("--mode", choices=("run", "resume", "restart"), default="run")
+    args = ap.parse_args()
+
+    source = Path(args.document).expanduser().resolve()
+    try:
+        result = run_job(source, args.collection, args.mode)
+        emit("result", result=result)
+        if result.get("status") == "PAUSED":
+            raise SystemExit(75)
+    except Exception as exc:
+        emit(
+            "error",
+            message=f"{type(exc).__name__}: {exc}",
+            traceback=traceback.format_exc(limit=16),
+        )
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
