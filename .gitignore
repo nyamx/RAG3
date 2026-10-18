@@ -5,3 +5,7 @@ __pycache__/
 data/
 .bridge*/
 .bridge_*
+/RAG3.exe
+/launcher/bin/
+/launcher/obj/
+/launcher/publish/

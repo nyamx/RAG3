@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "rag3": {
+      "type": "stdio",
+      "command": "cmd.exe",
+      "args": ["/d", "/c", "${PLUGIN_ROOT}/run-rag3.cmd"],
+      "env": {
+        "RAG3_PROJECT_ROOT": "C:\\python_program\\RAG3",
+        "RAG3_MCP_TRANSPORT": "stdio",
+        "RAG3_MCP_WRITE_ENABLED": "1",
+        "RAG3_MCP_DELETE_ENABLED": "1"
+      },
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}

@@ -10,7 +10,7 @@ from typing import Any, Callable
 from haystack.dataclasses import PipelineSnapshot
 
 ROOT = Path(__file__).resolve().parents[1]
-PIPELINE_SCHEMA_VERSION = "haystack-native-v1"
+PIPELINE_SCHEMA_VERSION = "haystack-native-v1-bm25"
 
 
 def _utc_now() -> str:

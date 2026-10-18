@@ -1,0 +1,23 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "rag3",
+  "version": "0.1.1",
+  "description": "Search and manage local RAG3 collections and documents through the existing MCP server.",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "RAG3",
+        "shortDescription": "내 문서 검색과 관리",
+        "longDescription": "로컬 RAG3 컬렉션에서 문서를 검색하고 원문을 읽습니다. 문서와 AI 생성 텍스트를 추가하고 수집 작업과 문서를 관리할 수도 있습니다.",
+        "developerName": "RAG3",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": [
+          "RAG3에서 이 주제와 관련된 문서를 찾아 출처와 함께 요약해 줘",
+          "RAG3 컬렉션과 문서 목록을 보여 줘",
+          "이 텍스트를 RAG3 컬렉션에 저장해 줘"
+        ]
+      }
+    }
+  }
+}

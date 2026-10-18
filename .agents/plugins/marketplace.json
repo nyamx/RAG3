@@ -1,0 +1,20 @@
+{
+  "name": "rag3-local",
+  "interface": {
+    "displayName": "RAG3 로컬"
+  },
+  "plugins": [
+    {
+      "name": "rag3",
+      "source": {
+        "source": "local",
+        "path": "./plugins/rag3"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

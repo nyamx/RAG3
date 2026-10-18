@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from haystack.dataclasses import Breakpoint
 from haystack.core.errors import BreakpointException
+from qdrant_client import QdrantClient, models as qdrant_models
 
 from rag3.checkpoint import CheckpointIdentity, CheckpointStore, PIPELINE_SCHEMA_VERSION
 from rag3.haystack_native import (
@@ -22,6 +23,7 @@ from rag3.haystack_native import (
     create_document_store,
     find_bge_m3,
     preserve_source,
+    prepare_docling_source,
 )
 
 
@@ -89,8 +91,49 @@ def run_to_breakpoint(pipe, *, data, snapshot, component: str, callback):
     raise RuntimeError(f"Expected breakpoint before {component} was not reached")
 
 
+
+def verify_source_in_qdrant(
+    *,
+    collection: str,
+    source_sha256: str,
+    url: str = "http://127.0.0.1:16333",
+) -> tuple[int, int]:
+    client = QdrantClient(url=url)
+    source_filter = qdrant_models.Filter(
+        must=[
+            qdrant_models.FieldCondition(
+                key="meta.source_sha256",
+                match=qdrant_models.MatchValue(value=source_sha256),
+            )
+        ]
+    )
+
+    point_count = 0
+    bm25_count = 0
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=source_filter,
+            limit=256,
+            offset=offset,
+            with_payload=False,
+            with_vectors=["bm25"],
+        )
+        for point in points:
+            point_count += 1
+            vectors = point.vector or {}
+            if isinstance(vectors, dict) and vectors.get("bm25") is not None:
+                bm25_count += 1
+        if offset is None:
+            break
+
+    return point_count, bm25_count
+
+
 def run_job(source: Path, collection: str, mode: str) -> dict:
     preserved = preserve_source(source)
+    docling_source = prepare_docling_source(preserved)
     source_sha = preserved["source_sha256"]
     model_path = str(find_bge_m3())
     identity = checkpoint_identity(source_sha, model_path, collection)
@@ -117,7 +160,7 @@ def run_job(source: Path, collection: str, mode: str) -> dict:
     }
     data = {
         "converter": {
-            "sources": [str(preserved["managed_source"])],
+            "sources": [str(docling_source)],
             "meta": base_meta,
         }
     }
@@ -143,11 +186,34 @@ def run_job(source: Path, collection: str, mode: str) -> dict:
         snapshot = checkpoints.load_snapshot(identity)
 
     emit("log", message="STAGE qdrant RUN")
-    result = pipe.run({}, pipeline_snapshot=snapshot, snapshot_callback=cb)
+    result = pipe.run(
+        {},
+        include_outputs_from={"writer", "bm25_writer"},
+        pipeline_snapshot=snapshot,
+        snapshot_callback=cb,
+    )
     count_after = store.count_documents()
     written = result.get("writer", {}).get("documents_written")
-    if count_after < 1 or written is None:
-        raise RuntimeError("Final Qdrant verification failed")
+    bm25_written = result.get("bm25_writer", {}).get("bm25_vectors_written")
+
+    source_point_count, source_bm25_count = verify_source_in_qdrant(
+        collection=collection,
+        source_sha256=source_sha,
+    )
+    if source_point_count < 1:
+        raise RuntimeError(
+            f"Final Qdrant verification failed: no points found for source {source_sha}"
+        )
+    if source_bm25_count != source_point_count:
+        raise RuntimeError(
+            "Final BM25 verification failed: "
+            f"source_points={source_point_count}, bm25_vectors={source_bm25_count}"
+        )
+
+    if written is not None and bm25_written is not None and bm25_written != written:
+        raise RuntimeError(
+            f"BM25 vector count mismatch: documents={written}, bm25={bm25_written}"
+        )
 
     checkpoints.set_state("COMPLETE", identity=identity)
     emit("log", message="STAGE qdrant PASS")
@@ -157,6 +223,9 @@ def run_job(source: Path, collection: str, mode: str) -> dict:
         "managed_source": str(preserved["managed_source"]),
         "collection": collection,
         "documents_written": written,
+        "bm25_vectors_written": bm25_written,
+        "source_point_count": source_point_count,
+        "source_bm25_count": source_bm25_count,
         "count_after": count_after,
     }
 
