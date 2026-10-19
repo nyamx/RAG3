@@ -988,6 +988,95 @@ async def rag3_direct_pdf_resource_probe() -> Annotated[CallToolResult, dict[str
     return await _run_tool(run)
 
 
+@mcp.tool(name="rag3_direct_pdf_max_probe", title="RAG3 near-limit direct PDF resource test",
+          description="Read-only ONE-SHOT maximum-size transfer experiment. Return the largest "
+                      "contiguous prefix of the verified chatgpt_001 original PDF that fits "
+                      "a conservative 10 MiB Secure MCP Tunnel serialized-response budget "
+                      "(64 KiB reserved). A single CallToolResult contains one "
+                      "application/pdf EmbeddedResource; no chunks, no widgets, no ingestion. "
+                      "Use a page not previously quoted to check actual PDF visibility. "
+                      "It may fail at the host/SDK size boundary; report the exact error.",
+          annotations=READ_ONLY, structured_output=True)
+async def rag3_direct_pdf_max_probe() -> Annotated[CallToolResult, dict[str, Any]]:
+    def run() -> CallToolResult:
+        import base64 as _b64
+        import hashlib as _sha
+        import json as _json
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        import pypdfium2 as _pdfium
+        from mcp.types import EmbeddedResource, BlobResourceContents
+        from rag3.sources import _resolve, _PDF_LOCK
+
+        collection = "chatgpt_001"
+        document_id = "0ce7a578bc3f180c575fa720783d0d2afff2c5dcc885b5bb6f02d93950b347dd"
+        tunnel_budget = 10 * 1024 * 1024
+        reserved = 64 * 1024
+        # Base64 is four characters per three source bytes. Leave additional
+        # room for the JSON-RPC envelope and duplicated small metadata.
+        max_pdf_bytes = ((tunnel_budget - reserved - 8192) // 4) * 3
+        original, source_digest = _resolve(collection, document_id, url=QDRANT_URL, verify=True)
+        with _PDF_LOCK:
+            with _pdfium.PdfDocument(str(original)) as src:
+                total_pages = len(src)
+                if total_pages < 1:
+                    raise ValueError("Empty source PDF")
+                with _tempfile.TemporaryDirectory(prefix="rag3-max-resource-") as tmp:
+                    target = _Path(tmp) / "prefix.pdf"
+                    def export_prefix(count: int) -> bytes:
+                        with _pdfium.PdfDocument.new() as dest:
+                            dest.import_pages(src, pages=list(range(count)))
+                            dest.save(str(target))
+                        return target.read_bytes()
+                    # Search for the largest contiguous prefix that fits. This
+                    # avoids splitting an already encoded PDF into invalid pieces.
+                    lo, hi = 1, total_pages
+                    best = None
+                    selected_pages = 0
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        candidate = export_prefix(mid)
+                        if len(candidate) <= max_pdf_bytes:
+                            best = candidate
+                            selected_pages = mid
+                            lo = mid + 1
+                        else:
+                            hi = mid - 1
+                    if best is None or not best.startswith(b"%PDF-"):
+                        raise ValueError("Source prefix cannot fit the 10 MiB test envelope")
+                    # Verify selected output is a valid PDF, not a raw binary slice.
+                    with _pdfium.PdfDocument(best) as verify:
+                        if len(verify) != selected_pages:
+                            raise ValueError("Prefix PDF page validation failed")
+        digest = _sha.sha256(best).hexdigest()
+        public = {
+            "probe": "DIRECT_MCP_PDF_NEAR_10MIB_V1",
+            "collection": collection,
+            "document_id": document_id,
+            "original_sha256": source_digest,
+            "original_bytes": original.stat().st_size,
+            "original_pages": total_pages,
+            "first_physical_page": 1,
+            "last_physical_page": selected_pages,
+            "pdf_bytes": len(best),
+            "pdf_sha256": digest,
+            "tunnel_limit_bytes": tunnel_budget,
+            "reserved_bytes": reserved,
+            "note": "Single PDF EmbeddedResource, NOT chunked. This is transport-size testing, not native attachment registration. PDF text is absent from metadata.",
+        }
+        uri = "rag3://direct-max-pdf/" + digest
+        result = CallToolResult(isError=False, structuredContent=public, content=[
+            TextContent(type="text", text=_json.dumps(public, separators=(",", ":"))),
+            EmbeddedResource(type="resource", resource=BlobResourceContents(
+                uri=uri, mimeType="application/pdf", blob=_b64.b64encode(best).decode("ascii"))),
+        ])
+        encoded_size = len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+        if encoded_size > tunnel_budget - reserved:
+            raise ValueError("Serialized result exceeds reserved tunnel size budget")
+        return result
+    return await _run_tool(run)
+
+
 @mcp.tool(name="rag3_model_context_probe", title="RAG3 모델 컨텍스트 전달 실험",
           description="Read-only isolated MCP Apps UI experiment for ui/update-model-context, "
                       "ui/message, and widget modelContent. Does not ingest, retrieve, "
