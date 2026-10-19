@@ -484,7 +484,7 @@ source_apps.add_resource(TextResource(uri=SOURCE_VIEW_URI,
     meta={"ui": {"prefersBorder": True,
                  "csp": ResourceCsp(connect_domains=[], resource_domains=[]).model_dump(by_alias=True)}}))
 
-CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v2.html"
+CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v3.html"
 source_apps.add_resource(TextResource(uri=CONTEXT_PROBE_VIEW_URI,
     text=(ROOT / "rag3/model-context-probe.html").read_text(encoding="utf-8"),
     title="RAG3 모델 컨텍스트 통신 시험", mime_type="text/html;profile=mcp-app",
@@ -821,6 +821,55 @@ async def rag3_delete_document(collection: str, document_id: str,
         if JOBS.has_active_collection(name):
             raise ValueError("collection has an active ingestion job")
         return delete_document(name, document_id, url=QDRANT_URL)
+    return await _run_tool(run)
+
+
+@mcp.tool(name="rag3_probe_real_pdf_page", title="RAG3 real PDF isolated transfer helper",
+          description="App-only read-only bounded extract of a known original PDF page for transfer tests.",
+          annotations=READ_ONLY, structured_output=True,
+          meta={"ui": {"visibility": ["app"]}, "openai/visibility": "private",
+                "openai/widgetAccessible": True})
+async def rag3_probe_real_pdf_page(page: Annotated[StrictInt, Field(ge=1, le=359)] = 40,
+                                   ) -> Annotated[CallToolResult, dict[str, Any]]:
+    def run() -> CallToolResult:
+        import tempfile
+        import pypdfium2 as pdfium
+        from rag3.sources import _resolve
+        if page not in (40, 100):
+            raise ValueError("experiment only permits original pages 40 and 100")
+        document_id = "0ce7a578bc3f180c575fa720783d0d2afff2c5dcc885b5bb6f02d93950b347dd"
+        source, source_hash = _resolve("chatgpt_001", document_id, url=QDRANT_URL, verify=False)
+        with pdfium.PdfDocument(str(source)) as pdf:
+            if page > len(pdf):
+                raise ValueError("page exceeds source document")
+            pg = pdf[page - 1]
+            try:
+                tp = pg.get_textpage()
+                try:
+                    preview = " ".join(tp.get_text_range().split())[:200]
+                finally:
+                    tp.close()
+            finally:
+                pg.close()
+            with tempfile.TemporaryDirectory(prefix="rag3-realpdf-probe-") as td:
+                target = Path(td) / "page.pdf"
+                with pdfium.PdfDocument.new() as dest:
+                    dest.import_pages(pdf, pages=[page - 1])
+                    dest.save(str(target))
+                pdf_bytes = target.read_bytes()
+                with pdfium.PdfDocument(str(target)) as test_pdf:
+                    if len(test_pdf) != 1:
+                        raise ValueError("extracted PDF is not exactly one page")
+        if not (1024 <= len(pdf_bytes) <= 262144):
+            raise ValueError("PDF sample exceeds 256 KiB bounded transport test")
+        digest = hashlib.sha256(pdf_bytes).hexdigest()
+        public = {"experiment": "rag3-original-page", "page": page,
+                  "size": len(pdf_bytes), "sha256": digest, "source_sha256": source_hash}
+        result = _ok(public)
+        result.meta = {"rag3/privatePdfProbe": dict(public,
+            pdf_base64=base64.b64encode(pdf_bytes).decode("ascii"),
+            local_text_preview=preview)}
+        return result
     return await _run_tool(run)
 
 

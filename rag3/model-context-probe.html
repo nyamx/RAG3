@@ -18,6 +18,8 @@ p{line-height:1.5;margin:8px 0}button{padding:7px 10px;margin:4px 4px 4px 0;curs
 <button id="pdfcontext" disabled>5. PDF EmbeddedResource → model-context</button>
 <button id="pdfmessage" disabled>6. PDF EmbeddedResource → ui/message</button>
 <button id="pdflink" disabled>7. PDF ResourceLink(data: URI) → ui/message</button>
+<button id="realpage40" disabled>8. 원본 PDF 40쪽 → model-context</button>
+<button id="realpage100" disabled>9. 원본 PDF 100쪽 → ui/message</button>
 <button id="reveal" disabled>결과 대조용 토큰 표시 (응답 후)</button>
 <p id="result" role="status">실험 전</p>
 </main><script>
@@ -145,6 +147,53 @@ $('pdflink').onclick=async()=>{
     info('7번 응답 수신: '+JSON.stringify(ret).slice(0,220)+'\nData URI 호스트 지원 여부만 시험하므로, 실패해도 정식 MCP resource_link 실패로 일반화하지 않습니다.');
   }catch(e){info('7번 실패 (data URI 지원 여부): '+e.message);}
 };
+// Real original PDF: fetched via a private app-only MCP tool, not RAG retrieval.
+// PDF bytes and ground-truth preview are deliberately excluded from model-facing tool output.
+async function realPdfPart(page){
+  const args={page};
+  const result=capabilities.serverTools
+    ?await request('tools/call',{name:'rag3_probe_real_pdf_page',arguments:args})
+    :typeof window.openai?.callTool==='function'
+      ?await window.openai.callTool('rag3_probe_real_pdf_page',args)
+      :await request('tools/call',{name:'rag3_probe_real_pdf_page',arguments:args});
+  if(result?.isError)throw new Error('앱 전용 PDF 전송 도구 실행 실패');
+  const d=result?._meta?.['rag3/privatePdfProbe'];
+  if(!d||d.page!==page||typeof d.pdf_base64!=='string')throw new Error('PDF 비공개 도구 응답 미수신');
+  const bytes=Uint8Array.from(atob(d.pdf_base64),c=>c.charCodeAt(0));
+  if(bytes.length!==d.size||await sha256hex(bytes)!==d.sha256)throw new Error('PDF SHA-256 불일치');
+  if(bytes.length<1024||bytes.length>262144)throw new Error('PDF 실험 크기 초과');
+  expected['realpage'+page]={sha256:d.sha256,page:page,preview:d.local_text_preview};
+  return {data:d,content:{type:'resource',resource:{
+    uri:'rag3-probe://original/page-'+page+'/'+d.sha256+'.pdf',
+    mimeType:'application/pdf',blob:d.pdf_base64}}};
+}
+async function sha256hex(bytes){
+  const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',bytes));
+  return Array.from(digest,x=>x.toString(16).padStart(2,'0')).join('');
+}
+$('realpage40').onclick=async()=>{
+  try{
+    info('실제 원본 40쪽 PDF를 비공개 MCP 도구에서 확인 중...');
+    const sample=await realPdfPart(40);
+    const r=await request('ui/update-model-context',{
+      content:[sample.content],structuredContent:{experiment:'rag3-original-pdf-40',bytes:sample.data.size}
+    });
+    info('8번 전송 성공: '+sample.data.size+' bytes, 호스트 응답: '+JSON.stringify(r).slice(0,140)+
+      '\n다음 메시지로 "방금 전달된 실제 PDF 40페이지의 문장 일부를 그대로 옮겨라. RAG3 검색을 쓰지 말고, 접근할 수 없다면 NOT_VISIBLE"이라고 질문하세요.');
+  }catch(e){info('8번 오류: '+e.message);}
+};
+$('realpage100').onclick=async()=>{
+  try{
+    info('실제 원본 100쪽 PDF를 비공개 MCP 도구에서 확인 중...');
+    const sample=await realPdfPart(100);
+    const r=await request('ui/message',{role:'user',content:[
+      {type:'text',text:'Independent RAG3 original PDF page 100 trial. Extract a verbatim short sentence from the attached PDF page; do not call RAG3 retrieval, do not use previous chat context, do not guess. If you cannot read the PDF, answer NOT_VISIBLE.'},
+      sample.content
+    ]});
+    info('9번 메시지 전송 성공: '+sample.data.size+' bytes, 호스트 응답: '+JSON.stringify(r).slice(0,140)+
+      '\n모델 답변 후에만 결과 대조용 버튼을 누르세요.');
+  }catch(e){info('9번 오류: '+e.message);}
+};
 $('reveal').onclick=()=>{
   info('EXPECTED (모델이 답변한 뒤에만 대조): '+JSON.stringify(expected));
 };
@@ -155,8 +204,8 @@ request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
   notify('ui/notifications/initialized',{});
   $('caps').textContent='호스트 선언: updateModelContext='+Boolean(capabilities.updateModelContext)+
     ', message='+Boolean(capabilities.message)+', widgetState='+Boolean(window.openai?.setWidgetState);
-  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','reveal'])$(id).disabled=false;
+  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','reveal'])$(id).disabled=false;
   info('호스트 연결 완료. 순서대로 1 → 2를 누르면 컨텍스트 전송을 검증할 수 있습니다.');
-  notify('ui/notifications/size-changed',{height:270});
+  notify('ui/notifications/size-changed',{height:340});
 }).catch(e=>info('ui/initialize 실패: '+e.message));
 </script></body></html>
