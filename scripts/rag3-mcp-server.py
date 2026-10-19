@@ -484,6 +484,13 @@ source_apps.add_resource(TextResource(uri=SOURCE_VIEW_URI,
     meta={"ui": {"prefersBorder": True,
                  "csp": ResourceCsp(connect_domains=[], resource_domains=[]).model_dump(by_alias=True)}}))
 
+CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v1.html"
+source_apps.add_resource(TextResource(uri=CONTEXT_PROBE_VIEW_URI,
+    text=(ROOT / "rag3/model-context-probe.html").read_text(encoding="utf-8"),
+    title="RAG3 모델 컨텍스트 통신 시험", mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"prefersBorder": True,
+                 "csp": ResourceCsp(connect_domains=[], resource_domains=[]).model_dump(by_alias=True)}}))
+
 mcp = MCPServer(
     "RAG3",
     title="RAG3",
@@ -815,6 +822,18 @@ async def rag3_delete_document(collection: str, document_id: str,
             raise ValueError("collection has an active ingestion job")
         return delete_document(name, document_id, url=QDRANT_URL)
     return await _run_tool(run)
+
+
+@mcp.tool(name="rag3_model_context_probe", title="RAG3 모델 컨텍스트 전달 실험",
+          description="Read-only isolated MCP Apps UI experiment for ui/update-model-context, "
+                      "ui/message, and widget modelContent. Does not ingest, retrieve, "
+                      "or modify original files. Ask user to click controls 1 then 2 in widget.",
+          annotations=READ_ONLY, structured_output=True,
+          meta={"ui": {"resourceUri": CONTEXT_PROBE_VIEW_URI, "visibility": ["model", "app"]},
+                "openai/outputTemplate": CONTEXT_PROBE_VIEW_URI})
+async def rag3_model_context_probe() -> Annotated[CallToolResult, dict[str, Any]]:
+    return _ok({"probe": "RAG3_WIDGET_CONTEXT_V1", "read_only": True,
+                "note": "Token is generated in the widget, not in the tool output."})
 
 
 if __name__ == "__main__":
