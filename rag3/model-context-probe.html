@@ -30,9 +30,9 @@ const bytes=new Uint8Array(8);crypto.getRandomValues(bytes);
 const challenge='R3CTX-'+Array.from(bytes, b=>b.toString(16).padStart(2,'0')).join('');
 function info(s){$('result').textContent=s;}
 function notify(method,params){window.parent.postMessage({jsonrpc:'2.0',method,params},'*');}
-function request(method,params){return new Promise((resolve,reject)=>{
+function request(method,params,timeoutMs=15000){return new Promise((resolve,reject)=>{
   const id=nextId++;
-  const timer=setTimeout(()=>{pending.delete(id);reject(new Error('호스트 요청 시간 초과: '+method));},15000);
+  const timer=setTimeout(()=>{pending.delete(id);reject(new Error('위젯 응답 대기 시간 초과 ('+Math.round(timeoutMs/1000)+'초): '+method));},timeoutMs);
   pending.set(id,{resolve,reject,timer});
   window.parent.postMessage({jsonrpc:'2.0',id,method,params},'*');
 });}
@@ -189,7 +189,7 @@ $('realpage100').onclick=async()=>{
     const r=await request('ui/message',{role:'user',content:[
       {type:'text',text:'Independent RAG3 original PDF page 100 trial. Extract a verbatim short sentence from the attached PDF page; do not call RAG3 retrieval, do not use previous chat context, do not guess. If you cannot read the PDF, answer NOT_VISIBLE.'},
       sample.content
-    ]});
+    ]},120000);
     info('9번 메시지 전송 성공: '+sample.data.size+' bytes, 호스트 응답: '+JSON.stringify(r).slice(0,140)+
       '\n모델 답변 후에만 결과 대조용 버튼을 누르세요.');
   }catch(e){info('9번 오류: '+e.message);}

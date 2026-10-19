@@ -484,7 +484,7 @@ source_apps.add_resource(TextResource(uri=SOURCE_VIEW_URI,
     meta={"ui": {"prefersBorder": True,
                  "csp": ResourceCsp(connect_domains=[], resource_domains=[]).model_dump(by_alias=True)}}))
 
-CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v3.html"
+CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v4.html"
 source_apps.add_resource(TextResource(uri=CONTEXT_PROBE_VIEW_URI,
     text=(ROOT / "rag3/model-context-probe.html").read_text(encoding="utf-8"),
     title="RAG3 모델 컨텍스트 통신 시험", mime_type="text/html;profile=mcp-app",
