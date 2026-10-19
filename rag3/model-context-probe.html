@@ -24,6 +24,7 @@ p{line-height:1.5;margin:8px 0}button{padding:7px 10px;margin:4px 4px 4px 0;curs
 <label for="pdfTargetKiB">11. 전송 목표 크기</label>
 <select id="pdfTargetKiB"><option value="64">64 KiB</option><option value="128">128 KiB</option><option value="256">256 KiB</option></select>
 <button id="sizeprobe" disabled>11. 원본 PDF 용량별 전송·시간 측정</button>
+<button id="libraryupload" disabled>12. 실제 원본 40쪽 PDF → ChatGPT Library 저장</button>
 <button id="reveal" disabled>결과 대조용 토큰 표시 (응답 후)</button>
 <p id="result" role="status">실험 전</p>
 </main><script>
@@ -281,6 +282,50 @@ $('sizeprobe').onclick=async()=>{
 $('reveal').onclick=()=>{
   info('EXPECTED (모델이 답변한 뒤에만 대조): '+JSON.stringify(expected));
 };
+
+// This test transfers a real 1-page original RAG3 PDF over MCP to the widget,
+// verifies its bytes locally, then uploads it to the ChatGPT host with
+// library:true. It does NOT place the PDF in the LLM context or ingest into RAG3.
+$('libraryupload').onclick=async()=>{
+  const btn=$('libraryupload');
+  btn.disabled=true;
+  try{
+    if(typeof window.openai?.uploadFile!=='function')throw new Error('window.openai.uploadFile unavailable');
+    info('12번: RAG3 원본 40페이지를 MCP로 수신 중...');
+    const sample=await realPdfPart(40);
+    const encoded=sample.content?.resource?.blob;
+    if(!encoded || typeof encoded!=='string')throw new Error('app-only PDF resource missing');
+    const raw=atob(encoded);
+    const bytes=new Uint8Array(raw.length);
+    for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+    if(bytes.length!==sample.data.size)throw new Error('PDF byte count mismatch');
+    const hash=await sha256hex(bytes);
+    if(hash!==sample.data.sha256)throw new Error('PDF SHA-256 mismatch');
+    const filename='RAG3-Library-40p-'+token('R3LIB').slice(6)+'.pdf';
+    const file=new File([bytes],filename,{type:'application/pdf'});
+    info('12번: SHA-256 일치 ('+file.size+' bytes). library:true 업로드 요청 중...');
+    const result=await window.openai.uploadFile(file,{library:true});
+    const fileId=result?.fileId;
+    if(typeof fileId!=='string'||!fileId)throw new Error('uploadFile returned no fileId');
+    let verification='getFileDownloadUrl not available';
+    if(typeof window.openai.getFileDownloadUrl==='function'){
+      try{
+        const dl=await window.openai.getFileDownloadUrl({fileId});
+        if(!dl?.downloadUrl)throw new Error('download URL absent');
+        const response=await fetch(dl.downloadUrl);
+        if(!response.ok)throw new Error('HTTP '+response.status);
+        const returned=new Uint8Array(await response.arrayBuffer());
+        verification=(returned.length===bytes.length && await sha256hex(returned)===hash)
+          ?'re-download SHA-256 MATCH':'re-download SHA-256 MISMATCH';
+      }catch(e){verification='re-download check unavailable: '+e.message;}
+    }
+    info('12번 호스트 업로드 성공 (Library 등록은 별도 검증 필요)\n'
+      +'filename='+filename+'\nfileId='+fileId+'\nbytes='+file.size+'\nsha256='+hash
+      +'\n'+verification+'\nChatGPT Library 목록에서 이 고유 filename을 확인하세요.');
+  }catch(e){info('12번 실패: '+e.message);}
+  finally{btn.disabled=false;}
+};
+
 request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
  appCapabilities:{availableDisplayModes:['inline']},protocolVersion:'2026-01-26'
 }).then(result=>{
@@ -288,7 +333,7 @@ request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
   notify('ui/notifications/initialized',{});
   $('caps').textContent='호스트 선언: updateModelContext='+Boolean(capabilities.updateModelContext)+
     ', message='+Boolean(capabilities.message)+', widgetState='+Boolean(window.openai?.setWidgetState);
-  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','reveal'])$(id).disabled=false;
+  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','libraryupload','reveal'])$(id).disabled=false;
   info('호스트 연결 완료. 순서대로 1 → 2를 누르면 컨텍스트 전송을 검증할 수 있습니다.');
   notify('ui/notifications/size-changed',{height:425});
 }).catch(e=>info('ui/initialize 실패: '+e.message));
