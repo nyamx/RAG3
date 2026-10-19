@@ -26,6 +26,8 @@ p{line-height:1.5;margin:8px 0}button{padding:7px 10px;margin:4px 4px 4px 0;curs
 <button id="sizeprobe" disabled>11. 원본 PDF 용량별 전송·시간 측정</button>
 <button id="libraryupload" disabled>12. 실제 원본 40쪽 PDF → ChatGPT Library 저장</button>
 <button id="librarypicker" disabled>13. Library 선택기 지원·목록 확인 (읽기 전용)</button>
+<button id="nativelibrary" disabled>14. OS 파일 선택 → ChatGPT Library 업로드</button>
+<input id="nativefile" type="file" accept=".pdf,application/pdf" style="display:none">
 <button id="reveal" disabled>결과 대조용 토큰 표시 (응답 후)</button>
 <p id="result" role="status">실험 전</p>
 </main><script>
@@ -347,6 +349,48 @@ $('librarypicker').onclick=async()=>{
   finally{button.disabled=false;}
 };
 
+
+// Compare a genuine OS-selected File object against the File constructed in test 12.
+// No model-context transfer or RAG3 ingestion; upload only after an explicit user click.
+$('nativelibrary').onclick=()=>{
+  if(typeof window.openai?.uploadFile!=='function'){
+    info('14번 실패: window.openai.uploadFile 미지원');return;
+  }
+  const inp=$('nativefile');inp.value='';inp.click();
+};
+$('nativefile').onchange=async()=>{
+  const file=$('nativefile').files?.[0];
+  if(!file){info('14번 취소: 파일을 선택하지 않았습니다.');return;}
+  if(!/\.pdf$/i.test(file.name) || file.size<1 || file.size>25*1024*1024){
+    info('14번 취소: 25MiB 이하의 PDF 1개만 선택하세요.');return;
+  }
+  const btn=$('nativelibrary');btn.disabled=true;
+  try{
+    info('14번: OS File 원본 SHA-256 계산 중...');
+    const digest=await sha256hex(new Uint8Array(await file.arrayBuffer()));
+    info('14번: '+file.name+' ('+file.size+' bytes)\nOS File 그대로 uploadFile({library:true}) 요청 중...');
+    const uploaded=await window.openai.uploadFile(file,{library:true});
+    const fileId=uploaded?.fileId;
+    if(typeof fileId!=='string'||!fileId)throw new Error('uploadFile 응답에 fileId 없음');
+    let verification='재다운로드 검증 불가';
+    if(typeof window.openai.getFileDownloadUrl==='function'){
+      try{
+        const dl=await window.openai.getFileDownloadUrl({fileId});
+        if(!dl?.downloadUrl)throw new Error('downloadUrl 없음');
+        const response=await fetch(dl.downloadUrl);
+        if(!response.ok)throw new Error('HTTP '+response.status);
+        const bytes=new Uint8Array(await response.arrayBuffer());
+        const dlHash=await sha256hex(bytes);
+        verification=(bytes.length===file.size && dlHash===digest)?'SHA-256 MATCH':'SHA-256 MISMATCH';
+      }catch(e){verification='재다운로드 검증 오류: '+String(e.message||e).slice(0,160);}
+    }
+    info('14번 OS 선택 업로드: host SUCCESS (Library 실제 등록은 별도 확인)\nfile='+file.name+
+      '\nbytes='+file.size+'\nsha256='+digest+'\nfileId='+fileId+
+      '\nre-download='+verification+'\n다음: ChatGPT Library에서 위 파일명을 검색하세요.');
+  }catch(e){info('14번 OS 선택 업로드 실패: '+String(e.message||e).slice(0,500));}
+  finally{btn.disabled=false;$('nativefile').value='';}
+};
+
 request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
  appCapabilities:{availableDisplayModes:['inline']},protocolVersion:'2026-01-26'
 }).then(result=>{
@@ -354,7 +398,7 @@ request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
   notify('ui/notifications/initialized',{});
   $('caps').textContent='호스트 선언: updateModelContext='+Boolean(capabilities.updateModelContext)+
     ', message='+Boolean(capabilities.message)+', widgetState='+Boolean(window.openai?.setWidgetState);
-  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','libraryupload','librarypicker','reveal'])$(id).disabled=false;
+  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','libraryupload','librarypicker','nativelibrary','reveal'])$(id).disabled=false;
   info('호스트 연결 완료. 순서대로 1 → 2를 누르면 컨텍스트 전송을 검증할 수 있습니다.');
   notify('ui/notifications/size-changed',{height:425});
 }).catch(e=>info('ui/initialize 실패: '+e.message));
