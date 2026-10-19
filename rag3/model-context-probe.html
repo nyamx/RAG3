@@ -14,7 +14,11 @@ p{line-height:1.5;margin:8px 0}button{padding:7px 10px;margin:4px 4px 4px 0;curs
 <button id="context" disabled>1. ui/update-model-context 전송</button>
 <button id="check" disabled>2. ui/message로 수신 확인</button>
 <button id="message" disabled>3. ui/message 직접 전송</button>
-<button id="state" disabled>4. setWidgetState modelContent</button>
+<button id="state" disabled>4. setWidgetState 고유 토큰</button>
+<button id="pdfcontext" disabled>5. PDF EmbeddedResource → model-context</button>
+<button id="pdfmessage" disabled>6. PDF EmbeddedResource → ui/message</button>
+<button id="pdflink" disabled>7. PDF ResourceLink(data: URI) → ui/message</button>
+<button id="reveal" disabled>결과 대조용 토큰 표시 (응답 후)</button>
 <p id="result" role="status">실험 전</p>
 </main><script>
 'use strict';
@@ -59,11 +63,90 @@ $('check').onclick=()=>doRequest('ui/message',{
 $('message').onclick=()=>doRequest('ui/message',{
   role:'user',content:[{type:'text',text:'RAG3 ui/message 직접 전송 테스트. 아래 토큰을 답하세요: '+challenge}]
 });
-$('state').onclick=()=>{
-  try{if(typeof window.openai?.setWidgetState!=='function')throw new Error('OpenAI widget API 미지원');
-    window.openai.setWidgetState({modelContent:text,privateContent:{experiment:'RAG3 probe'}});
-    info('setWidgetState 호출 완료 (모델에서 보이는지는 별도 확인 필요).');
-  }catch(e){info('setWidgetState 실패: '+e.message);}
+// Independent secrets are never put into tool results or outgoing test instructions.
+// Do not click "reveal" until AFTER asking the model for its answer.
+const expected={};
+function token(prefix){
+  const v=new Uint8Array(10);crypto.getRandomValues(v);
+  return prefix+'-'+Array.from(v,b=>b.toString(16).padStart(2,'0')).join('');
+}
+$('state').onclick=async()=>{
+  try {
+    if(typeof window.openai?.setWidgetState!=='function')throw new Error('OpenAI widget API 미지원');
+    const value=token('R3STATE');
+    await window.openai.setWidgetState({
+      modelContent:'Widget state ONLY: The unique state-only challenge is '+value+'.',
+      privateContent:{experiment:'RAG3 state-isolated-v2'}
+    });
+    expected.state=value;
+    info('4번 위젯 상태 저장 완료. 지금 ChatGPT에 "위젯 상태에만 있는 R3STATE- 토큰을 출력해"라고 질문하세요. 이전 대화에서 추측하지 마세요.');
+  }catch(e){info('4번 setWidgetState 실패: '+e.message);}
+};
+// Small self-contained valid one-page ASCII PDF. Marker occurs ONLY in its PDF stream.
+// This is an isolated transport test, not the user's RAG3 document or ingestion.
+function createPdf(marker){
+  const stream='BT /F1 16 Tf 48 740 Td (RAG3 PRIVATE PDF MARKER: '+marker+') Tj ET\n';
+  const objects=[
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    '<< /Length '+stream.length+' >>\nstream\n'+stream+'endstream'
+  ];
+  let pdf='%PDF-1.4\n';const offsets=[0];
+  for(let i=0;i<objects.length;i++){
+    offsets.push(pdf.length);
+    pdf+=(i+1)+' 0 obj\n'+objects[i]+'\nendobj\n';
+  }
+  const startxref=pdf.length;
+  pdf+='xref\n0 '+(objects.length+1)+'\n0000000000 65535 f \n';
+  for(let i=1;i<offsets.length;i++)pdf+=String(offsets[i]).padStart(10,'0')+' 00000 n \n';
+  pdf+='trailer\n<< /Size '+(objects.length+1)+' /Root 1 0 R >>\nstartxref\n'+startxref+'\n%%EOF\n';
+  return {blob:btoa(pdf), bytes:pdf.length};
+}
+function makeResource(prefix){
+  const marker=token(prefix);
+  const pdf=createPdf(marker);
+  const uri='rag3-probe://context-pdf/'+prefix.toLowerCase()+'/'+marker+'.pdf';
+  return {marker,pdf,uri, block:{type:'resource',resource:{uri,mimeType:'application/pdf',blob:pdf.blob}}};
+}
+$('pdfcontext').onclick=async()=>{
+  const d=makeResource('R3PDFCTX');
+  try{
+    const ret=await request('ui/update-model-context',{
+      content:[d.block],structuredContent:{experiment:'rag3-pdf-embedded-v2',mode:'context'}
+    });
+    expected.pdfcontext=d.marker;
+    info('5번 응답 수신: '+JSON.stringify(ret).slice(0,220)+
+      '\nPDF EmbeddedResource '+d.pdf.bytes+' bytes. 토큰은 출력하지 않습니다. 다음 사용자 메시지에서 "방금 전달된 PDF 내부 R3PDFCTX- 토큰을 읽어라. 확인할 수 없으면 NOT_VISIBLE"이라고 질문하세요.');
+  }catch(e){info('5번 실패: '+e.message);}
+};
+$('pdfmessage').onclick=async()=>{
+  const d=makeResource('R3PDFMSG');
+  try{
+    expected.pdfmessage=d.marker;
+    const ret=await request('ui/message',{role:'user',content:[
+      {type:'text',text:'RAG3 PDF resource test: extract the R3PDFMSG- token from the attached PDF binary only. Never guess and never invoke RAG3 retrieval. If you cannot read PDF contents, answer NOT_VISIBLE.'},
+      d.block
+    ]});
+    info('6번 응답 수신: '+JSON.stringify(ret).slice(0,220)+'\n모델 응답을 받은 뒤 토큰 대조 버튼을 누르세요.');
+  }catch(e){info('6번 실패: '+e.message);}
+};
+$('pdflink').onclick=async()=>{
+  const d=makeResource('R3PDFLINK');
+  try{
+    expected.pdflink=d.marker;
+    const link={type:'resource_link',name:'rag3-pdf-link-test.pdf',mimeType:'application/pdf',
+      uri:'data:application/pdf;base64,'+d.pdf.blob,size:d.pdf.bytes};
+    const ret=await request('ui/message',{role:'user',content:[
+      {type:'text',text:'RAG3 ResourceLink data-URI test: open the linked PDF and return its R3PDFLINK- token. If the data: URI cannot be opened or contents are not visible, answer NOT_VISIBLE.'},
+      link
+    ]});
+    info('7번 응답 수신: '+JSON.stringify(ret).slice(0,220)+'\nData URI 호스트 지원 여부만 시험하므로, 실패해도 정식 MCP resource_link 실패로 일반화하지 않습니다.');
+  }catch(e){info('7번 실패 (data URI 지원 여부): '+e.message);}
+};
+$('reveal').onclick=()=>{
+  info('EXPECTED (모델이 답변한 뒤에만 대조): '+JSON.stringify(expected));
 };
 request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
  appCapabilities:{availableDisplayModes:['inline']},protocolVersion:'2026-01-26'
@@ -72,7 +155,7 @@ request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
   notify('ui/notifications/initialized',{});
   $('caps').textContent='호스트 선언: updateModelContext='+Boolean(capabilities.updateModelContext)+
     ', message='+Boolean(capabilities.message)+', widgetState='+Boolean(window.openai?.setWidgetState);
-  for(const id of ['context','check','message','state'])$(id).disabled=false;
+  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','reveal'])$(id).disabled=false;
   info('호스트 연결 완료. 순서대로 1 → 2를 누르면 컨텍스트 전송을 검증할 수 있습니다.');
   notify('ui/notifications/size-changed',{height:270});
 }).catch(e=>info('ui/initialize 실패: '+e.message));
