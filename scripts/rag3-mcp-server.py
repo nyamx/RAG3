@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
 from mcp.server import MCPServer
 from mcp.server.apps import Apps, ResourceCsp
 from mcp.server.mcpserver.resources.types import TextResource
-from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
+from mcp.types import CallToolResult, EmbeddedResource, BlobResourceContents, ImageContent, TextContent, ToolAnnotations
 
 from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
 from rag3.collections import (collection_contents, create_collection,
@@ -931,6 +931,60 @@ async def rag3_probe_pdf_size(target_kib: Annotated[StrictInt, Field(ge=64, le=2
             pdf_base64=base64.b64encode(best_bytes).decode("ascii"),
             last_page_text_preview=preview)}
         return result
+    return await _run_tool(run)
+
+
+@mcp.tool(name="rag3_direct_pdf_resource_probe", title="RAG3 direct MCP PDF resource probe",
+          description="Read-only controlled experiment: return physical page 40 of a verified "
+                      "stored PDF directly as an MCP CallToolResult EmbeddedResource "
+                      "(application/pdf). No widget, ingestion, or document changes. "
+                      "The short text/structured output contains metadata only, NOT PDF text. "
+                      "Use PDF binary content to answer, or report NOT_VISIBLE if unreadable.",
+          annotations=READ_ONLY, structured_output=True)
+async def rag3_direct_pdf_resource_probe() -> Annotated[CallToolResult, dict[str, Any]]:
+    def run() -> CallToolResult:
+        import hashlib
+        import tempfile
+        import pypdfium2 as pdfium
+        from rag3.sources import _resolve
+
+        collection = "chatgpt_001"
+        document_id = "0ce7a578bc3f180c575fa720783d0d2afff2c5dcc885b5bb6f02d93950b347dd"
+        physical_page = 40
+        original, original_sha256 = _resolve(collection, document_id, url=QDRANT_URL, verify=True)
+        with tempfile.TemporaryDirectory(prefix="rag3-direct-resource-probe-") as tmp:
+            target = Path(tmp) / "page-40.pdf"
+            with pdfium.PdfDocument(str(original)) as src:
+                if len(src) < physical_page:
+                    raise ValueError("Verified source does not have page 40")
+                with pdfium.PdfDocument.new() as dest:
+                    dest.import_pages(src, pages=[physical_page - 1])
+                    dest.save(str(target))
+            pdf_bytes = target.read_bytes()
+        if not pdf_bytes.startswith(b"%PDF-") or not 0 < len(pdf_bytes) <= 128 * 1024:
+            raise ValueError("Direct PDF test source is not a valid bounded PDF slice")
+        excerpt_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+        public = {"probe": "DIRECT_MCP_PDF_EMBEDDED_RESOURCE_V1",
+                  "collection": collection, "document_id": document_id,
+                  "physical_page": physical_page, "mime_type": "application/pdf",
+                  "pdf_bytes": len(pdf_bytes), "pdf_sha256": excerpt_sha256,
+                  "original_sha256": original_sha256,
+                  "note": "No extracted text in metadata. Read content from EmbeddedResource if exposed."}
+        return CallToolResult(
+            isError=False,
+            structuredContent=public,
+            content=[
+                TextContent(type="text", text=_json_text(public)),
+                EmbeddedResource(
+                    type="resource",
+                    resource=BlobResourceContents(
+                        uri="rag3://direct-probe/page-40/" + excerpt_sha256,
+                        mimeType="application/pdf",
+                        blob=base64.b64encode(pdf_bytes).decode("ascii"),
+                    ),
+                ),
+            ],
+        )
     return await _run_tool(run)
 
 
