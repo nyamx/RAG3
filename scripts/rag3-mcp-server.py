@@ -484,7 +484,7 @@ source_apps.add_resource(TextResource(uri=SOURCE_VIEW_URI,
     meta={"ui": {"prefersBorder": True,
                  "csp": ResourceCsp(connect_domains=[], resource_domains=[]).model_dump(by_alias=True)}}))
 
-CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v5.html"
+CONTEXT_PROBE_VIEW_URI = "ui://rag3/model-context-probe-v6.html"
 source_apps.add_resource(TextResource(uri=CONTEXT_PROBE_VIEW_URI,
     text=(ROOT / "rag3/model-context-probe.html").read_text(encoding="utf-8"),
     title="RAG3 모델 컨텍스트 통신 시험", mime_type="text/html;profile=mcp-app",
@@ -869,6 +869,67 @@ async def rag3_probe_real_pdf_page(page: Annotated[StrictInt, Field(ge=1, le=359
         result.meta = {"rag3/privatePdfProbe": dict(public,
             pdf_base64=base64.b64encode(pdf_bytes).decode("ascii"),
             local_text_preview=preview)}
+        return result
+    return await _run_tool(run)
+
+
+@mcp.tool(name="rag3_probe_pdf_size", title="RAG3 original PDF bounded-size probe",
+          description="App-only read-only transfer diagnostic using a bounded multi-page original PDF slice.",
+          annotations=READ_ONLY, structured_output=True,
+          meta={"ui": {"visibility": ["app"]}, "openai/visibility": "private",
+                "openai/widgetAccessible": True})
+async def rag3_probe_pdf_size(target_kib: Annotated[StrictInt, Field(ge=64, le=256)] = 64,
+                             ) -> Annotated[CallToolResult, dict[str, Any]]:
+    def run() -> CallToolResult:
+        import tempfile
+        import time
+        import pypdfium2 as pdfium
+        from rag3.sources import _resolve
+        if target_kib not in (64, 128, 256):
+            raise ValueError("probe target_kib must be 64, 128, or 256")
+        t0 = time.perf_counter()
+        document_id = "0ce7a578bc3f180c575fa720783d0d2afff2c5dcc885b5bb6f02d93950b347dd"
+        source, source_hash = _resolve("chatgpt_001", document_id, url=QDRANT_URL, verify=True)
+        start = 100
+        limit_bytes = target_kib * 1024
+        best_bytes, best_n = None, 0
+        with pdfium.PdfDocument(str(source)) as pdf:
+            if len(pdf) < start + 23:
+                raise ValueError("original PDF lacks sufficient pages for this test")
+            with tempfile.TemporaryDirectory(prefix="rag3-size-probe-") as td:
+                out = Path(td) / "subset.pdf"
+                for n in range(1, 25):
+                    with pdfium.PdfDocument.new() as dest:
+                        dest.import_pages(pdf, pages=list(range(start - 1, start - 1 + n)))
+                        dest.save(str(out))
+                    candidate = out.read_bytes()
+                    if len(candidate) > limit_bytes:
+                        break
+                    best_bytes, best_n = candidate, n
+            if best_bytes is None:
+                raise ValueError("a one-page PDF exceeds the requested size bound")
+            last_page = pdf[start + best_n - 2]
+            try:
+                textpage = last_page.get_textpage()
+                try:
+                    preview = " ".join(textpage.get_text_range().split())[:280]
+                finally:
+                    textpage.close()
+            finally:
+                last_page.close()
+        if not (1024 <= len(best_bytes) <= limit_bytes):
+            raise ValueError("invalid bounded PDF payload")
+        digest = hashlib.sha256(best_bytes).hexdigest()
+        elapsed_ms = round((time.perf_counter() - t0) * 1000)
+        public = {"experiment": "rag3-original-pdf-size",
+                  "target_kib": target_kib, "start_page": start,
+                  "end_page": start + best_n - 1, "page_count": best_n,
+                  "size": len(best_bytes), "sha256": digest,
+                  "source_sha256": source_hash, "local_prepare_ms": elapsed_ms}
+        result = _ok(public)
+        result.meta = {"rag3/privatePdfSizeProbe": dict(public,
+            pdf_base64=base64.b64encode(best_bytes).decode("ascii"),
+            last_page_text_preview=preview)}
         return result
     return await _run_tool(run)
 

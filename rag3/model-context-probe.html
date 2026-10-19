@@ -21,6 +21,9 @@ p{line-height:1.5;margin:8px 0}button{padding:7px 10px;margin:4px 4px 4px 0;curs
 <button id="realpage40" disabled>8. 원본 PDF 40쪽 → model-context</button>
 <button id="realpage100" disabled>9. 원본 PDF 100쪽 → ui/message</button>
 <button id="realpage100ctx" disabled>10. 원본 100쪽 → model-context → 텍스트 message</button>
+<label for="pdfTargetKiB">11. 전송 목표 크기</label>
+<select id="pdfTargetKiB"><option value="64">64 KiB</option><option value="128">128 KiB</option><option value="256">256 KiB</option></select>
+<button id="sizeprobe" disabled>11. 원본 PDF 용량별 전송·시간 측정</button>
 <button id="reveal" disabled>결과 대조용 토큰 표시 (응답 후)</button>
 <p id="result" role="status">실험 전</p>
 </main><script>
@@ -217,6 +220,64 @@ $('realpage100ctx').onclick=async()=>{
       ', message='+JSON.stringify(r).slice(0,110)+'\n모델의 실제 PDF 문장 접근은 별도로 판정해야 합니다.');
   }catch(e){info('10번 오류: '+e.message);}
 };
+// Independent bounded-size test: one explicit click, no automatic size sweep.
+// Local PDF preparation time, app transfer time and host API timings are distinct;
+// none of these measure the duration of the model's answer generation.
+$('sizeprobe').onclick=async()=>{
+  const selected=Number($('pdfTargetKiB').value);
+  if(![64,128,256].includes(selected)){info('11번 오류: 허용되지 않은 크기');return;}
+  const button=$('sizeprobe');button.disabled=true;
+  const begin=performance.now();let stage='private MCP tool';
+  try{
+    info('11번: 실제 PDF '+selected+' KiB 이하 페이지 묶음 생성·조회 중...');
+    const args={target_kib:selected};
+    const result=capabilities.serverTools
+      ?await request('tools/call',{name:'rag3_probe_pdf_size',arguments:args},120000)
+      :typeof window.openai?.callTool==='function'
+        ?await window.openai.callTool('rag3_probe_pdf_size',args)
+        :await request('tools/call',{name:'rag3_probe_pdf_size',arguments:args},120000);
+    if(result?.isError)throw new Error('비공개 원본 조회 도구 실행 실패');
+    const d=result?._meta?.['rag3/privatePdfSizeProbe'];
+    if(!d||d.target_kib!==selected||typeof d.pdf_base64!=='string')throw new Error('비공개 PDF 데이터 미수신');
+    stage='PDF SHA-256 validation';
+    const pdf=Uint8Array.from(atob(d.pdf_base64),c=>c.charCodeAt(0));
+    if(pdf.length!==d.size||pdf.length>selected*1024||pdf.length<1024||
+       await sha256hex(pdf)!==d.sha256)throw new Error('바이트 크기 또는 SHA-256 불일치');
+    const preparationAndVerifyMs=Math.round(performance.now()-begin);
+    const nonce=token('R3SIZE'+selected);
+    expected['size'+selected]={sha256:d.sha256,startPage:d.start_page,
+      endPage:d.end_page,previewLastPage:d.last_page_text_preview,nonce};
+    const content={type:'resource',resource:{
+      uri:'rag3-probe://size/'+d.sha256+'.pdf',mimeType:'application/pdf',blob:d.pdf_base64}};
+    stage='ui/update-model-context';
+    info('11번: '+d.size+' bytes, '+d.start_page+'-'+d.end_page+
+      '쪽 PDF를 모델 컨텍스트로 전달 중...');
+    const contextStart=performance.now();
+    const contextResult=await request('ui/update-model-context',{
+      content:[content],structuredContent:{experiment:'rag3-pdf-size-v6',
+      target_kib:selected,size:d.size,pages:d.page_count}
+    },120000);
+    const contextMs=Math.round(performance.now()-contextStart);
+    stage='ui/message text-only';
+    info('11번: 컨텍스트 요청 반환 '+contextMs+'ms, 텍스트 질문 전달 중...');
+    const messageStart=performance.now();
+    const msgResult=await request('ui/message',{role:'user',content:[
+      {type:'text',text:'RAG3 V6 bounded-size PDF test. Echo '+nonce+
+        ' exactly, then quote ONE complete sentence that actually appears on the LAST page of the attached '+
+        d.page_count+'-page PDF. Do not use RAG3 search or previous messages. If the resource is not visible, say '+nonce+' NOT_VISIBLE.'}
+    ]},120000);
+    const messageMs=Math.round(performance.now()-messageStart);
+    info('11번 완료: '+d.size+' bytes (Base64 '+d.pdf_base64.length+' chars), 페이지 '+
+      d.start_page+'-'+d.end_page+', local preparation '+d.local_prepare_ms+'ms, '+
+      'tool+SHA check '+preparationAndVerifyMs+'ms, context '+contextMs+'ms, '+
+      'message host-return '+messageMs+'ms, total '+Math.round(performance.now()-begin)+'ms.\n'+
+      'Context='+JSON.stringify(contextResult).slice(0,100)+
+      '; message='+JSON.stringify(msgResult).slice(0,100)+
+      '\n주의: 모델 답변 생성 시간은 위 수치에 포함되지 않으며, 문장 정합성은 결과 대조 버튼으로 확인.');
+  }catch(e){info('11번 실패: 단계='+stage+', 목표='+selected+' KiB, 경과 '+
+    Math.round(performance.now()-begin)+'ms, 오류='+e.message);}
+  finally{button.disabled=false;}
+};
 $('reveal').onclick=()=>{
   info('EXPECTED (모델이 답변한 뒤에만 대조): '+JSON.stringify(expected));
 };
@@ -227,8 +288,8 @@ request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
   notify('ui/notifications/initialized',{});
   $('caps').textContent='호스트 선언: updateModelContext='+Boolean(capabilities.updateModelContext)+
     ', message='+Boolean(capabilities.message)+', widgetState='+Boolean(window.openai?.setWidgetState);
-  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','reveal'])$(id).disabled=false;
+  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','reveal'])$(id).disabled=false;
   info('호스트 연결 완료. 순서대로 1 → 2를 누르면 컨텍스트 전송을 검증할 수 있습니다.');
-  notify('ui/notifications/size-changed',{height:340});
+  notify('ui/notifications/size-changed',{height:425});
 }).catch(e=>info('ui/initialize 실패: '+e.message));
 </script></body></html>
