@@ -36,6 +36,7 @@ from rag3.sources import SourceError, render_page, source_metadata, source_part
 COLLECTION = os.environ.get("RAG3_COLLECTION", DEFAULT_NATIVE_COLLECTION)
 QDRANT_URL = os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL)
 _COLLECTION_LOCK = threading.RLock()
+_COLLECTION_INITIALIZED = False
 _CALL_COLLECTION: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag3_collection", default=None)
 JOBS = JobManager(qdrant_url=QDRANT_URL)
 # First backend use imports the local parsing/embedding stack (~45s on this PC).
@@ -115,7 +116,10 @@ def _json_text(value: object) -> str:
 
 
 def _current_collection() -> str:
-    return _CALL_COLLECTION.get() or COLLECTION
+    selected = _CALL_COLLECTION.get()
+    if selected is None:
+        raise ToolFailure("COLLECTION_NOT_SELECTED", "Select an existing collection with rag3_select_collection.", False)
+    return selected
 
 
 def _ok(body: dict) -> CallToolResult:
@@ -471,9 +475,24 @@ def _collection_name(name: str) -> str:
     return name
 
 
-def _selected_collection() -> str:
+def _selected_collection(*, required: bool = True, available: list[str] | None = None) -> str | None:
+    """Resolve configured selection once; subsequently invalidate deleted selections.
+
+    Never silently switch a live server to a different collection after deletion.
+    """
+    global COLLECTION, _COLLECTION_INITIALIZED
+    existing = available if available is not None else list_collections(url=QDRANT_URL)
     with _COLLECTION_LOCK:
-        return COLLECTION
+        if not _COLLECTION_INITIALIZED:
+            if COLLECTION not in existing:
+                COLLECTION = existing[0] if len(existing) == 1 else None
+            _COLLECTION_INITIALIZED = True
+        elif COLLECTION is not None and COLLECTION not in existing:
+            COLLECTION = None
+        selected = COLLECTION
+    if required and selected is None:
+        raise ToolFailure("COLLECTION_NOT_SELECTED", "No valid collection selected. Use rag3_select_collection.", False)
+    return selected
 
 
 SOURCE_VIEW_URI = "ui://rag3/original-source-v9.html"
@@ -497,8 +516,7 @@ DELETE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint
 
 
 def _locked_search(query: str, options: dict | None = None) -> dict:
-    with _COLLECTION_LOCK:
-        selected = COLLECTION
+    selected = _selected_collection()
     token = _CALL_COLLECTION.set(selected)
     try:
         return _search_impl(query, options)
@@ -507,8 +525,7 @@ def _locked_search(query: str, options: dict | None = None) -> dict:
 
 
 def _locked_fetch(ref_id: str, offset: int) -> dict:
-    with _COLLECTION_LOCK:
-        selected = COLLECTION
+    selected = _selected_collection()
     token = _CALL_COLLECTION.set(selected)
     try:
         return _fetch_impl(ref_id, offset)
@@ -590,8 +607,9 @@ async def rag3_search_advanced(
           annotations=READ_ONLY, structured_output=True)
 async def rag3_list_collections() -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
-        return {"collections": list_collections(url=QDRANT_URL),
-                "selected": _selected_collection()}
+        available = list_collections(url=QDRANT_URL)
+        return {"collections": available,
+                "selected": _selected_collection(required=False, available=available)}
     return await _run_tool(run)
 
 
@@ -600,12 +618,13 @@ async def rag3_list_collections() -> Annotated[CallToolResult, dict[str, Any]]:
           annotations=WRITE, structured_output=True)
 async def rag3_select_collection(collection: str) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
-        global COLLECTION
+        global COLLECTION, _COLLECTION_INITIALIZED
         name = _collection_name(collection)
         if name not in list_collections(url=QDRANT_URL):
             raise ValueError(f"collection does not exist: {name}")
         with _COLLECTION_LOCK:
             COLLECTION = name
+            _COLLECTION_INITIALIZED = True
         return {"selected": name}
     return await _run_tool(run)
 
@@ -636,7 +655,7 @@ async def rag3_delete_collection(collection: str, confirm_collection: str) -> An
         name = _collection_name(collection)
         if confirm_collection != name:
             raise ValueError("confirm_collection must exactly match collection")
-        if name == _selected_collection():
+        if name == _selected_collection(required=False):
             raise ValueError("select a different collection before deleting this one")
         if JOBS.has_active_collection(name):
             raise ValueError("collection has an active ingestion job")
@@ -747,8 +766,8 @@ async def rag3_get_document(
           meta={"ui": {"resourceUri": SOURCE_VIEW_URI, "visibility": ["model", "app"]},
                 "openai/outputTemplate": SOURCE_VIEW_URI})
 async def rag3_get_source(document_id: str, collection: str = "") -> Annotated[CallToolResult, dict[str, Any]]:
-    selected = collection or _selected_collection()
-    return await _run_tool(lambda: source_metadata(selected, document_id, url=QDRANT_URL))
+    return await _run_tool(lambda: source_metadata(collection or _selected_collection(),
+                                                    document_id, url=QDRANT_URL))
 
 
 @mcp.tool(name="rag3_read_source_part", title="RAG3 원본 전송",
@@ -789,8 +808,8 @@ async def rag3_get_page(document_id: str, page: Annotated[StrictInt, Field(ge=1)
                         collection: str = "",
                         max_dimension: Annotated[StrictInt, Field(ge=512, le=3000)] = 2000,
                         ) -> Annotated[CallToolResult, dict[str, Any]]:
-    selected = collection or _selected_collection()
     def run() -> CallToolResult:
+        selected = collection or _selected_collection()
         metadata, image = render_page(selected, document_id, page,
                                       max_dimension=max_dimension, url=QDRANT_URL)
         result = _ok(metadata)
