@@ -25,6 +25,7 @@ p{line-height:1.5;margin:8px 0}button{padding:7px 10px;margin:4px 4px 4px 0;curs
 <select id="pdfTargetKiB"><option value="64">64 KiB</option><option value="128">128 KiB</option><option value="256">256 KiB</option></select>
 <button id="sizeprobe" disabled>11. 원본 PDF 용량별 전송·시간 측정</button>
 <button id="libraryupload" disabled>12. 실제 원본 40쪽 PDF → ChatGPT Library 저장</button>
+<button id="librarypicker" disabled>13. Library 선택기 지원·목록 확인 (읽기 전용)</button>
 <button id="reveal" disabled>결과 대조용 토큰 표시 (응답 후)</button>
 <p id="result" role="status">실험 전</p>
 </main><script>
@@ -326,6 +327,26 @@ $('libraryupload').onclick=async()=>{
   finally{btn.disabled=false;}
 };
 
+
+// Read-only feature check and user-invoked Library picker. No uploads or deletions.
+$('librarypicker').onclick=async()=>{
+  const button=$('librarypicker'); button.disabled=true;
+  const upload=typeof window.openai?.uploadFile==='function';
+  const select=typeof window.openai?.selectFiles==='function';
+  const download=typeof window.openai?.getFileDownloadUrl==='function';
+  const header='13번 기능 탐지: uploadFile='+upload+', selectFiles='+select+', getFileDownloadUrl='+download;
+  if(!select){info(header+'\nLibrary 선택 API 사용 불가 (이 사용자/앱 환경에서 기능이 제공되지 않음).');button.disabled=false;return;}
+  try{
+    info(header+'\nLibrary 파일 선택창을 여는 중입니다. 파일을 선택하거나 취소할 수 있습니다.');
+    const files=await window.openai.selectFiles();
+    if(!Array.isArray(files))throw new Error('selectFiles returned non-array');
+    const list=files.map(x=>({name:String(x.fileName||''),mime:String(x.mimeType||''),hasFileId:!!x.fileId}));
+    info(header+'\nLibrary 선택창 반환 파일 수='+list.length+'\n'+JSON.stringify(list).slice(0,2500)+
+        '\n이 결과는 사용자가 선택한 파일만 보여주며 Library 전체 파일 목록이 아닙니다.');
+  }catch(e){info(header+'\nLibrary 선택기 결과/오류: '+String(e?.message||e).slice(0,400));}
+  finally{button.disabled=false;}
+};
+
 request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
  appCapabilities:{availableDisplayModes:['inline']},protocolVersion:'2026-01-26'
 }).then(result=>{
@@ -333,7 +354,7 @@ request('ui/initialize',{appInfo:{name:'RAG3 context probe',version:'1.0.0'},
   notify('ui/notifications/initialized',{});
   $('caps').textContent='호스트 선언: updateModelContext='+Boolean(capabilities.updateModelContext)+
     ', message='+Boolean(capabilities.message)+', widgetState='+Boolean(window.openai?.setWidgetState);
-  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','libraryupload','reveal'])$(id).disabled=false;
+  for(const id of ['context','check','message','state','pdfcontext','pdfmessage','pdflink','realpage40','realpage100','realpage100ctx','sizeprobe','libraryupload','librarypicker','reveal'])$(id).disabled=false;
   info('호스트 연결 완료. 순서대로 1 → 2를 누르면 컨텍스트 전송을 검증할 수 있습니다.');
   notify('ui/notifications/size-changed',{height:425});
 }).catch(e=>info('ui/initialize 실패: '+e.message));
