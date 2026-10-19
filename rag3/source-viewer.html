@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAG3 원본 파일</title>
+<style>
+:root{color-scheme:light dark;font:15px system-ui,sans-serif}body{margin:0;padding:20px;color:CanvasText;background:Canvas}
+main{max-width:640px;margin:auto}h2{font-size:18px;margin:0 0 8px;overflow-wrap:anywhere}p{line-height:1.5;margin:8px 0;color:GrayText}
+progress{width:100%;margin-top:14px}#status{font-size:14px}#error{color:#bf3535}
+img{display:block;width:100%;height:auto;margin-top:12px;border-radius:6px}[hidden]{display:none!important}
+</style></head><body><main>
+<h2 id="filename">원본 파일 확인 중</h2><p id="details"></p>
+<img id="page-image" hidden alt="원본 PDF 페이지">
+<progress id="progress" value="0" max="1" hidden></progress>
+<p id="status" role="status">연결 중입니다.</p><p id="error" role="alert"></p>
+</main><script>
+'use strict';
+let nextId=1, source=null, host={}, hostReady=false, transferKey=null, transferTask=null;
+const pending=new Map(), $=id=>document.getElementById(id);
+function notify(method,params){window.parent.postMessage({jsonrpc:'2.0',method,params},'*');}
+function request(method,params){
+  return new Promise((resolve,reject)=>{
+    const id=nextId++;
+    const timer=setTimeout(()=>{pending.delete(id);reject(new Error('응답이 지연됩니다. 다시 시도해 주세요.'));},90000);
+    pending.set(id,{resolve,reject,timer});
+    window.parent.postMessage({jsonrpc:'2.0',id,method,params},'*');
+  });
+}
+function showSource(value){
+  if(!value?.first_part_uri)return;
+  source=value;
+  $('filename').textContent=value.filename;
+  $('details').textContent=new Intl.NumberFormat('ko-KR').format(value.file_size)+'바이트 · 저장된 원본 그대로';
+  updateReady();
+}
+function showResult(result){
+  const value=result?.structuredContent;
+  const pageImage=result?._meta?.['rag3/pageImage'];
+  const image=pageImage||result?.content?.find(item=>item.type==='image');
+  if(value?.page&&image){
+    $('filename').textContent=value.filename;
+    $('details').textContent='PDF '+value.page+' / '+value.page_count+'페이지 · 원본 페이지 미리보기';
+    $('status').textContent='';
+    $('page-image').src='data:'+(image.mime_type||image.mimeType)+';base64,'+image.data;
+    $('page-image').alt='원본 PDF '+value.page+'페이지';$('page-image').hidden=false;
+    return;
+  }
+  showSource(value);
+}
+function updateReady(){
+  if(!source||!hostReady)return;
+  const canRead=!!(host.serverResources||host.serverTools||window.openai?.callTool);
+  if(!canRead||!host.downloadFile){
+    $('status').textContent='이 호스트는 승인 없는 자동 파일 반환을 지원하지 않습니다. 원본 페이지 조회는 사용할 수 있습니다.';
+    return;
+  }
+  const key=source.collection+'/'+source.document_id+'/'+source.source_sha256;
+  if(transferKey===key)return;
+  transferKey=key;
+  transferTask=downloadSource(source);
+}
+window.addEventListener('message',event=>{
+  if(event.source!==window.parent||event.data?.jsonrpc!=='2.0')return;
+  const message=event.data;
+  if(!message.method&&pending.has(message.id)){
+    const entry=pending.get(message.id);pending.delete(message.id);clearTimeout(entry.timer);
+    if(message.error)entry.reject(new Error(message.error.message||'요청을 처리하지 못했습니다.'));
+    else entry.resolve(message.result);
+  }else if(message.method==='ui/notifications/tool-result'){
+    if(message.params?.isError){$('error').textContent='원본 파일을 확인하지 못했습니다.';return;}
+    showResult(message.params);
+  }else if(message.method==='ping'){
+    window.parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');
+  }else if(message.method==='ui/resource-teardown'){
+    for(const entry of pending.values()){clearTimeout(entry.timer);entry.reject(new Error('화면이 닫혔습니다.'));}
+    pending.clear();window.parent.postMessage({jsonrpc:'2.0',id:message.id,result:{}},'*');
+  }
+});
+async function sha256(bytes){
+  const hash=await crypto.subtle.digest('SHA-256',bytes);
+  return Array.from(new Uint8Array(hash),b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function downloadSource(original){
+  $('error').textContent='';
+  $('progress').hidden=false;$('progress').max=original.file_size||1;$('progress').value=0;
+  try{
+    const parts=[], encoded=[];let offset=0, useResources=!!host.serverResources;
+    do{
+      let part;
+      if(useResources){
+        const uri=original.first_part_uri.replace(/\/0$/,'/'+offset);
+        try{
+          const result=await request('resources/read',{uri});
+          part=JSON.parse(result.contents[0].text);
+        }catch(error){
+          // Some hosts advertise resource reads but restrict them to the HTML
+          // widget URI. Use the explicitly app-accessible transport tool.
+          if(!(host.serverTools||window.openai?.callTool)||!/scope|not supported|not found/i.test(error.message))throw error;
+          useResources=false;
+        }
+      }
+      if(!useResources){
+        const args={collection:original.collection,document_id:original.document_id,offset};
+        const result=host.serverTools
+          ?await request('tools/call',{name:'rag3_read_source_part',arguments:args})
+          :await window.openai.callTool('rag3_read_source_part',args);
+        if(result?.isError)throw new Error('원본 파일을 받지 못했습니다. 원본 가져오기를 다시 요청해 주세요.');
+        part=result?._meta?.['rag3/sourcePart'];
+        if(!part)throw new Error('이 화면에서 파일 데이터를 전달하지 못했습니다.');
+      }
+      if(part.offset!==offset||part.file_size!==original.file_size||part.source_sha256!==original.source_sha256)
+        throw new Error('원본 파일이 변경됐습니다. 원본 가져오기를 다시 요청해 주세요.');
+      const bytes=Uint8Array.from(atob(part.data_base64),c=>c.charCodeAt(0));
+      if(part.end_offset!==offset+bytes.length||await sha256(bytes)!==part.part_sha256)
+        throw new Error('파일 전달을 확인하지 못했습니다. 다시 시도해 주세요.');
+      if(part.next_offset!==null&&(part.next_offset!==part.end_offset||bytes.length!==original.part_bytes))
+        throw new Error('파일 전달 순서가 올바르지 않습니다.');
+      parts.push(bytes);encoded.push(part.data_base64);offset=part.end_offset;
+      $('progress').value=offset;
+      $('status').textContent='원본 파일을 받는 중: '+Math.floor(100*offset/original.file_size)+'%';
+      if(part.next_offset===null)break;
+    }while(offset<original.file_size);
+    if(offset!==original.file_size)throw new Error('원본 파일을 끝까지 받지 못했습니다.');
+    const combined=new Uint8Array(original.file_size);let cursor=0;
+    for(const bytes of parts){combined.set(bytes,cursor);cursor+=bytes.length;}
+    if(await sha256(combined)!==original.source_sha256)throw new Error('원본 파일과 내용이 일치하지 않습니다.');
+    $('status').textContent='원본 확인 완료. 다운로드를 요청합니다.';
+    const result=await request('ui/download-file',{contents:[{type:'resource',resource:{
+      uri:'file:///'+encodeURIComponent(original.filename),mimeType:original.mime_type,blob:encoded.join('')
+    }}]});
+    if(result?.isError)throw new Error('호스트가 자동 파일 반환을 허용하지 않았습니다.');
+    $('status').textContent='원본 검증을 마치고 호스트에 파일 저장을 요청했습니다.';
+  }catch(error){$('error').textContent=error.message||'자동 파일 반환에 실패했습니다.';$('status').textContent='원본 가져오기를 다시 호출해 주세요.';}
+}
+request('ui/initialize',{appInfo:{name:'RAG3 original source',version:'1.0.0'},
+  appCapabilities:{availableDisplayModes:['inline']},protocolVersion:'2026-01-26'
+}).then(result=>{
+  host=result.hostCapabilities||{};hostReady=true;notify('ui/notifications/initialized',{});
+  if(result.hostContext?.theme)document.documentElement.style.colorScheme=result.hostContext.theme;
+  notify('ui/notifications/size-changed',{height:240});updateReady();
+}).catch(()=>{$('status').textContent='파일 화면에 연결하지 못했습니다. 원본 가져오기를 다시 요청해 주세요.';});
+window.addEventListener('openai:set_globals',event=>{
+  if(event.detail?.globals?.toolOutput)showResult({structuredContent:event.detail.globals.toolOutput,
+    _meta:window.openai?.toolResponseMetadata?.mcp_tool_result?._meta});
+  updateReady();
+});
+if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>{
+  if(hostReady)notify('ui/notifications/size-changed',{height:Math.ceil(document.body.scrollHeight)});
+}).observe(document.body);
+</script></body></html>

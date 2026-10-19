@@ -11,3 +11,4 @@ rapidocr==3.9.1
 torch==2.11.0+cu128
 torchvision==0.26.0+cu128
 mcp==2.3.0
+pypdfium2==5.14.0

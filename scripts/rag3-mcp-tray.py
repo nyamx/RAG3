@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "scripts" / "rag3-mcp-server.py"
 UI = ROOT / "scripts" / "ingest-ui.py"
+TUNNEL_AUTOSTART = ROOT / "scripts" / "rag3-tunnel-autostart.py"
 
 
 def _configured_port() -> int:
@@ -118,6 +119,7 @@ class TrayController(QObject):
         self.app = app
         self.process: subprocess.Popen | None = None
         self.ui_process: subprocess.Popen | None = None
+        self.tunnel_autostart_launched = False
         self.port = 0
         self.started_at = 0.0
         self.crashes: list[float] = []
@@ -200,10 +202,28 @@ class TrayController(QObject):
                     QTimer.singleShot(2000, self.start_server)
             return
         if _port_open(self.port):
+            if not self.tunnel_autostart_launched:
+                self.tunnel_autostart_launched = True
+                self._start_tunnel_autostart()
             if "running" not in self.status_action.text():
                 self._status(f"running at 127.0.0.1:{self.port}", "#238b45")
         elif time.monotonic() - self.started_at > 90:
             self._status("startup timed out; see log", "#c0392b")
+
+    def _start_tunnel_autostart(self) -> None:
+        """Run the existing saved-key tunnel connector without showing a prompt."""
+        if not TUNNEL_AUTOSTART.is_file():
+            return
+        try:
+            subprocess.Popen(
+                [_gui_python(), str(TUNNEL_AUTOSTART)], cwd=ROOT,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            # The helper writes sanitized status to data/logs/tunnel-autostart.log.
+            pass
 
     def stop_server(self) -> None:
         self.stopping = True
@@ -224,6 +244,7 @@ class TrayController(QObject):
         self.stop_server()
         self.stopping = False
         self.crashes.clear()
+        self.tunnel_autostart_launched = False
         self.start_server()
 
     def _activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
