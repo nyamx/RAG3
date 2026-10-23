@@ -1,4 +1,4 @@
-"""Run full-document parsing and embedding in separate GPU processes."""
+"""Legacy document worker; the shared backend uses its CPU parse phase."""
 
 from __future__ import annotations
 
@@ -327,6 +327,11 @@ def main() -> None:
     args = parser.parse_args()
     source = Path(args.document).expanduser().resolve()
     try:
+        if args.phase == "parse" and os.environ.get("RAG3_PARSE_PARENT_GATE") == "1":
+            # The backend first attaches this process to a kill-on-close
+            # Windows Job Object. EOF means the parent died before arming it.
+            if sys.stdin.read(1) != "G":
+                raise RuntimeError("CPU parser parent gate closed")
         if args.phase == "parse":
             result = parse_source(source, args.collection, args.source_sha)
         elif args.phase == "embed":

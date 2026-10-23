@@ -25,6 +25,47 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 
+class BackendCommandFailure(Exception):
+    """A bounded, client-safe error shared by MCP tools and the local UI API."""
+
+    def __init__(self, code: str, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
+class SearchCallBudget:
+    """Carry one request deadline into a worker thread and its GPU queue item."""
+
+    def __init__(self, timeout_seconds: float):
+        # Expire the GPU item just before the outer HTTP/MCP wait times out.
+        self.deadline_monotonic = time.monotonic() + max(.001, timeout_seconds - .25)
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._requests = []
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def track(self, request) -> None:
+        with self._lock:
+            if not self._cancelled:
+                self._requests.append(request)
+                return
+        request.cancel()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            requests = tuple(self._requests)
+            self._requests.clear()
+        for request in requests:
+            request.cancel()
+
+
 class SessionCollections:
     """Selections never become process-wide defaults after a client changes one."""
     def __init__(self, preferred: str | None, *, limit: int = 512, ttl: float = 4 * 3600):
@@ -377,14 +418,31 @@ def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: s
                 raise ValueError('params must be an object')
         except (ValueError, UnicodeDecodeError, TypeError):
             return JSONResponse({'ok': False, 'error': {'code': 'INVALID_ARGUMENT'}}, status_code=400)
+        budget = None
         try:
             # Synchronous Qdrant and legacy job RPC must not block the MCP event loop.
-            result = await asyncio.wait_for(asyncio.to_thread(ui_commands, payload['action'], params), timeout=90)
+            budget = SearchCallBudget(90) if payload['action'] == 'search' else None
+            if budget is None:
+                call = asyncio.to_thread(ui_commands, payload['action'], params)
+            else:
+                call = asyncio.to_thread(ui_commands, payload['action'], params, budget)
+            result = await asyncio.wait_for(call, timeout=90)
             return JSONResponse({'ok': True, 'result': result})
+        except BackendCommandFailure as exc:
+            status = 400 if exc.code == 'INVALID_ARGUMENT' else 504 if exc.code == 'TIMEOUT' else 503
+            return JSONResponse({'ok': False, 'error': {'code': exc.code,
+                                                       'message': exc.message,
+                                                       'retryable': exc.retryable}}, status_code=status)
         except ValueError as exc:
             return JSONResponse({'ok': False, 'error': {'code': 'INVALID_ARGUMENT',
                                                        'message': str(exc)[:250]}}, status_code=400)
         except TimeoutError:
+            if budget is not None:
+                budget.cancel()
             return JSONResponse({'ok': False, 'error': {'code': 'TIMEOUT'}}, status_code=504)
+        except asyncio.CancelledError:
+            if budget is not None:
+                budget.cancel()
+            raise
         except Exception:
             return JSONResponse({'ok': False, 'error': {'code': 'BACKEND_ERROR'}}, status_code=503)

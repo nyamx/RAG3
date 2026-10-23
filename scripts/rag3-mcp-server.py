@@ -29,18 +29,21 @@ from mcp.server.mcpserver.resources.types import TextResource
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
 from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
-from rag3.backend_boundary import SessionCollections, session_identifier, install_routes, issue_ui_token, single_instance
+from rag3.backend_boundary import (BackendCommandFailure, SearchCallBudget,
+                                   SessionCollections, session_identifier,
+                                   install_routes, issue_ui_token, single_instance)
 from rag3.collections import (collection_contents, create_collection,
                               delete_collections, delete_document,
                               get_document, list_collections, update_chunk_sections)
 from rag3.mcp_jobs import JobManager
-from rag3.gpu_model_service import GPUModelService
+from rag3.gpu_model_service import GPUModelService, GPUServiceError
 from rag3.sources import SourceError, render_page, source_metadata, source_part
 
 QDRANT_URL = os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL)
 _SESSION_COLLECTIONS = SessionCollections(os.environ.get("RAG3_COLLECTION", DEFAULT_NATIVE_COLLECTION))
 _CALL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("rag3_session", default="direct-call")
 _CALL_COLLECTION: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag3_collection", default=None)
+_CALL_BUDGET: contextvars.ContextVar[SearchCallBudget | None] = contextvars.ContextVar("rag3_call_budget", default=None)
 JOBS = JobManager(qdrant_url=QDRANT_URL)
 # Stage C backend semantic search owner; legacy UI worker conversion remains D.
 GPU_BGE_SERVICE = GPUModelService()
@@ -116,12 +119,8 @@ class SectionUpdateInput(TypedDict):
     section_paths: list[str]
 
 
-class ToolFailure(Exception):
-    def __init__(self, code: str, message: str, retryable: bool) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.retryable = retryable
+class ToolFailure(BackendCommandFailure):
+    pass
 
 
 def _json_text(value: object) -> str:
@@ -350,6 +349,36 @@ def _neighbor_ids(fields: dict) -> tuple[str | None, str | None, bool]:
     )
 
 
+_GPU_SEARCH_ERRORS = {
+    "INVALID_ARGUMENT": ("INVALID_ARGUMENT", "GPU search request is invalid.", False),
+    "QUEUE_FULL": ("QUEUE_FULL", "GPU search queue is full.", True),
+    "DEADLINE_EXCEEDED": ("TIMEOUT", "Search exceeded its request deadline.", True),
+    "CANCELLED": ("CANCELLED", "Search was cancelled before completion.", True),
+    "CUDA_OOM": ("CUDA_OOM", "GPU memory was exhausted during search.", True),
+    "CUDA_UNAVAILABLE": ("CUDA_UNAVAILABLE", "CUDA is unavailable for semantic search.", False),
+    "GPU_INIT_FAILED": ("GPU_INIT_FAILED", "GPU model initialization failed.", False),
+    "GPU_EXECUTION_FAILED": ("GPU_EXECUTION_FAILED", "GPU search encoding failed.", False),
+    "GPU_DEVICE_INVALID": ("GPU_DEVICE_INVALID", "GPU model device verification failed.", False),
+    "GPU_DEVICE_UNVERIFIED": ("GPU_DEVICE_UNVERIFIED", "GPU model device could not be verified.", False),
+    "GPU_FAILED": ("GPU_FAILED", "GPU search service failed.", False),
+    "SERVICE_STOPPED": ("GPU_SERVICE_STOPPED", "GPU search service is stopped.", True),
+}
+
+
+def _encode_query_gpu(text: str) -> list[float]:
+    budget = _CALL_BUDGET.get()
+    if budget is not None and budget.cancelled:
+        raise ToolFailure("TIMEOUT", "Search exceeded its request deadline.", True)
+    request = GPU_BGE_SERVICE.submit_query(
+        text, deadline_monotonic=budget.deadline_monotonic if budget is not None else None)
+    if budget is not None:
+        budget.track(request)
+    vector = request.result()
+    if budget is not None and budget.cancelled:
+        raise ToolFailure("TIMEOUT", "Search exceeded its request deadline.", True)
+    return vector
+
+
 def _search_impl(query: str, options: dict | None = None) -> dict:
     from rag3.retrieval import search as core_search
 
@@ -361,13 +390,23 @@ def _search_impl(query: str, options: dict | None = None) -> dict:
     try:
         result = core_search(
             stripped, collection=_current_collection(), qdrant_url=QDRANT_URL,
-            dense_encoder=lambda text: GPU_BGE_SERVICE.submit_query(text).result(),
+            dense_encoder=_encode_query_gpu,
             **(options or {}),
         )
+    except ToolFailure:
+        raise
+    except GPUServiceError as exc:
+        code, message, retryable = _GPU_SEARCH_ERRORS.get(
+            exc.code, ("BACKEND_ERROR", "GPU search service failed.", True))
+        raise ToolFailure(code, message, retryable) from exc
     except ValueError as exc:
         raise ToolFailure("INVALID_ARGUMENT", str(exc), False) from exc
     except Exception as exc:
         raise ToolFailure("BACKEND_ERROR", "RAG3 retrieval failed.", True) from exc
+
+    budget = _CALL_BUDGET.get()
+    if budget is not None and budget.cancelled:
+        raise ToolFailure("TIMEOUT", "Search exceeded its request deadline.", True)
 
     output: list[SearchResult] = []
     seen: set[str] = set()
@@ -458,11 +497,18 @@ def _fetch_impl(ref_id: str, offset: int) -> dict:
 
 async def _timed_call(fn, *args, session_key: str | None = None):
     token = _CALL_SESSION.set(session_key) if session_key is not None else None
+    budget = SearchCallBudget(TOOL_TIMEOUT_SECONDS)
+    budget_token = _CALL_BUDGET.set(budget)
     try:
         return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=TOOL_TIMEOUT_SECONDS)
     except TimeoutError as exc:
+        budget.cancel()
         raise ToolFailure("TIMEOUT", f"Tool execution exceeded {int(TOOL_TIMEOUT_SECONDS)} seconds.", True) from exc
+    except asyncio.CancelledError:
+        budget.cancel()
+        raise
     finally:
+        _CALL_BUDGET.reset(budget_token)
         if token is not None:
             _CALL_SESSION.reset(token)
 
@@ -963,7 +1009,7 @@ def _ui_nonnegative_int(p: dict, key: str, default: int) -> int:
     return number
 
 
-def _ui_command(action: str, p: dict) -> dict:
+def _ui_command(action: str, p: dict, budget: SearchCallBudget | None = None) -> dict:
     'A-stage compatibility gateway; C replaces manager RPC, D migrates the UI.'
     if action == 'collections.list':
         return {'collections': list_collections(url=QDRANT_URL)}
@@ -990,8 +1036,12 @@ def _ui_command(action: str, p: dict) -> dict:
         options = p.get('options')
         if options is not None and not isinstance(options, dict):
             raise ValueError('options must be an object')
-        return _locked_search(_ui_text(p, 'query'), options,
-                              _collection_name(_ui_text(p, 'collection')))
+        token = _CALL_BUDGET.set(budget)
+        try:
+            return _locked_search(_ui_text(p, 'query'), options,
+                                  _collection_name(_ui_text(p, 'collection')))
+        finally:
+            _CALL_BUDGET.reset(token)
     if action == 'jobs.health':
         from rag3.ingestion_manager import _BACKEND_SCHEDULER
         if _BACKEND_SCHEDULER is None:
@@ -1049,9 +1099,12 @@ if __name__ == "__main__":
             from rag3.ingestion_manager import install_backend_scheduler
             scheduler = BackendScheduler(GPU_BGE_SERVICE)
             scheduler.boot()
-            install_backend_scheduler(scheduler)
-            _register_backend_routes(port)
-            mcp.run(transport=transport, host="127.0.0.1", port=port,
-                    max_request_body_size=sys.maxsize)
+            try:
+                install_backend_scheduler(scheduler)
+                _register_backend_routes(port)
+                mcp.run(transport=transport, host="127.0.0.1", port=port,
+                        max_request_body_size=sys.maxsize)
+            finally:
+                scheduler.stop()
     else:
         mcp.run(transport=transport)
