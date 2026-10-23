@@ -90,6 +90,18 @@ class GPURequest:
     def cancel(self) -> bool:
         return self._service.cancel(self._request)
 
+    def wait_execution_end(self) -> None:
+        """Wait until a non-preemptible CUDA call has actually finished.
+
+        The Future may be marked done earlier by timeout or cancellation.
+        This must only be called from outside the GPU owner thread.
+        """
+        if threading.get_ident() == self._service._owner_thread_id:
+            raise RuntimeError('GPU owner cannot wait on itself')
+        with self._service._condition:
+            while self._service._current is self._request:
+                self._service._condition.wait()
+
     def result(self, timeout: float | None = None):
         # An external deadline applies even while model loading runs.
         remaining = max(0.0, self._request.deadline - self._service._clock())

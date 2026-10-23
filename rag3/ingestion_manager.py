@@ -34,37 +34,45 @@ SUPPORTED_UI = {'.pdf','.doc','.docx','.md','.pptx','.xlsx','.html','.htm','.txt
                 '.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
 
 
+# Only the lock-owning backend may install the in-process scheduler.
+_BACKEND_SCHEDULER = None
+
+
+def install_backend_scheduler(scheduler):
+    global _BACKEND_SCHEDULER
+    if _BACKEND_SCHEDULER is not None:
+        raise RuntimeError('Backend ingestion scheduler already installed')
+    _BACKEND_SCHEDULER = scheduler
+
+
 def client(action, **params):
-    """RPC with startup handshake: no silent, detached fallback worker."""
-    payload = json.dumps({'action': action, 'params': params}).encode('utf-8')
-    def send():
-        token = TOKEN_FILE.read_text(encoding='ascii') if TOKEN_FILE.is_file() else ''
-        req = Request(f'http://{HOST}:{PORT}/command', payload,
-                      {'Content-Type':'application/json','X-RAG3-Token':token}, method='POST')
-        with urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-        if not data.get('ok'):
-            raise ValueError(data.get('error') or 'ingestion manager error')
-        return data['result']
+    """Use backend-local dispatch or authenticated HTTP; NEVER launch manager."""
+    scheduler = _BACKEND_SCHEDULER
+    if scheduler is not None:
+        return dispatch(scheduler, {'action':action, 'params':params})
+    mapping={'status':'jobs.status','list':'jobs.list','action':'jobs.action',
+             'submit':'jobs.submit','has_active_collection':'jobs.has_active_collection',
+             'health':'jobs.health'}
+    if action not in mapping:
+        raise ValueError('invalid ingestion action')
+    port=int(os.environ.get('RAG3_MCP_PORT','8000'))
+    from rag3.backend_boundary import _token_file
+    token_file=_token_file(ROOT,port)
+    if not token_file.is_file():
+        raise RuntimeError('RAG3 backend is not running; no legacy ingestion manager will be started')
+    payload=json.dumps({'action':mapping[action],'params':params}).encode('utf-8')
+    token=token_file.read_text(encoding='ascii')
+    req=Request(f'http://127.0.0.1:{port}/api/v1/command',payload,
+                {'Content-Type':'application/json','X-RAG3-Token':token},method='POST')
     try:
-        return send()
-    except (URLError, ConnectionError, TimeoutError, OSError) as first:
-        flags = (getattr(subprocess, 'DETACHED_PROCESS', 0) |
-                 getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)) if os.name == 'nt' else 0
-        python = str(PROCESS_PYTHON if PROCESS_PYTHON.exists() else sys.executable)
-        log_dir = ROOT / 'data'; log_dir.mkdir(parents=True, exist_ok=True)
-        with (log_dir / 'ingestion-manager.log').open('ab') as log:
-            subprocess.Popen([python, '-m', 'rag3.ingestion_manager', '--serve'], cwd=ROOT,
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                             creationflags=flags, start_new_session=os.name != 'nt')
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            time.sleep(.2)
-            try:
-                return send()
-            except (URLError, ConnectionError, TimeoutError, OSError):
-                pass
-        raise RuntimeError(f'Ingestion manager did not start: {first}') from first
+        with urlopen(req,timeout=95) as response:
+            data=json.loads(response.read())
+    except (URLError,ConnectionError,TimeoutError,OSError) as exc:
+        raise RuntimeError('RAG3 backend unavailable; legacy manager not started') from exc
+    if not data.get('ok'):
+        err=data.get('error') or {}
+        raise ValueError(str(err.get('message') or err.get('code') or 'Backend rejected request'))
+    return data['result']
 
 
 class Scheduler:
@@ -431,6 +439,7 @@ def dispatch(scheduler, request):
 
 
 def serve():
+    raise RuntimeError('Legacy ingestion manager server is disabled: use shared HTTP backend')
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args): pass
         def do_POST(self):

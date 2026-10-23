@@ -42,7 +42,7 @@ _SESSION_COLLECTIONS = SessionCollections(os.environ.get("RAG3_COLLECTION", DEFA
 _CALL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("rag3_session", default="direct-call")
 _CALL_COLLECTION: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag3_collection", default=None)
 JOBS = JobManager(qdrant_url=QDRANT_URL)
-# Stage B owner; existing retrieval/ingestion uses legacy direct BGE until C/D.
+# Stage C backend semantic search owner; legacy UI worker conversion remains D.
 GPU_BGE_SERVICE = GPUModelService()
 # First backend use imports the local parsing/embedding stack (~45s on this PC).
 # Keep the limit below the Secure MCP Tunnel's 120-second request deadline.
@@ -359,7 +359,11 @@ def _search_impl(query: str, options: dict | None = None) -> dict:
     if len(query) > 2000:
         raise ToolFailure("INVALID_ARGUMENT", "query must be at most 2000 Unicode characters.", False)
     try:
-        result = core_search(stripped, collection=_current_collection(), qdrant_url=QDRANT_URL, **(options or {}))
+        result = core_search(
+            stripped, collection=_current_collection(), qdrant_url=QDRANT_URL,
+            dense_encoder=lambda text: GPU_BGE_SERVICE.submit_query(text).result(),
+            **(options or {}),
+        )
     except ValueError as exc:
         raise ToolFailure("INVALID_ARGUMENT", str(exc), False) from exc
     except Exception as exc:
@@ -988,6 +992,13 @@ def _ui_command(action: str, p: dict) -> dict:
             raise ValueError('options must be an object')
         return _locked_search(_ui_text(p, 'query'), options,
                               _collection_name(_ui_text(p, 'collection')))
+    if action == 'jobs.health':
+        from rag3.ingestion_manager import _BACKEND_SCHEDULER
+        if _BACKEND_SCHEDULER is None:
+            raise RuntimeError('Backend scheduler not initialized')
+        return {'alive': True, 'active_job_id': _BACKEND_SCHEDULER.active_id}
+    if action == 'jobs.has_active_collection':
+        return {'active': JOBS.has_active_collection(_collection_name(_ui_text(p, 'collection')))}
     if action == 'jobs.list':
         collection, status = p.get('collection', ''), p.get('status', '')
         if not isinstance(collection, str) or not isinstance(status, str):
@@ -1000,16 +1011,16 @@ def _ui_command(action: str, p: dict) -> dict:
     if action == 'jobs.status':
         return JOBS.status(_ui_text(p, 'job_id'))
     if action == 'jobs.submit':
-        from rag3.ingestion_manager import client as manager_client
-        return manager_client('submit', origin='UI',
+        from rag3.ingestion_manager import client as backend_jobs
+        return backend_jobs('submit', origin='UI',
                               collection=_collection_name(_ui_text(p, 'collection')),
                               path=_ui_text(p, 'path'), requested=False)
     if action == 'jobs.action':
         operation = _ui_text(p, 'operation')
         if operation not in {'run', 'pause', 'resume', 'retry', 'cancel', 'hide', 'restart'}:
             raise ValueError('Invalid job operation')
-        from rag3.ingestion_manager import client as manager_client
-        return manager_client('action', job_id=_ui_text(p, 'job_id'), operation=operation)
+        from rag3.ingestion_manager import client as backend_jobs
+        return backend_jobs('action', job_id=_ui_text(p, 'job_id'), operation=operation)
     raise ValueError('Unknown UI API action')
 
 
@@ -1033,6 +1044,12 @@ if __name__ == "__main__":
         # Original attachments are downloaded out of band, without a file-size cap.
         # Do not impose the old 40 MiB application request cap on local clients.
         with single_instance(ROOT, port):
+            # The backend lock is held before touching the ingestion journal.
+            from rag3.ingestion_backend import BackendScheduler
+            from rag3.ingestion_manager import install_backend_scheduler
+            scheduler = BackendScheduler(GPU_BGE_SERVICE)
+            scheduler.boot()
+            install_backend_scheduler(scheduler)
             _register_backend_routes(port)
             mcp.run(transport=transport, host="127.0.0.1", port=port,
                     max_request_body_size=sys.maxsize)

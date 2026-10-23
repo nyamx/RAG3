@@ -70,11 +70,7 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
     client = QdrantClient(url=os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL))
     progress = ingestion_progress(collection, source_sha)
     if progress is None:
-        client.delete(collection_name=collection,
-                      points_selector=models.FilterSelector(filter=source_filter(source_sha)),
-                      wait=True)
-        set_ingestion_progress(collection, source_sha, identity, "PARSING")
-        progress = ingestion_progress(collection, source_sha)
+        raise ValueError("Parsing requires an initialized matching ingestion progress; refuse unscoped reset")
     if progress is None or progress["identity"] != identity:
         raise ValueError("No compatible Qdrant ingestion progress for this source")
     if progress["phase"] in {"CHUNKS_STORED", "EMBEDDING"}:
@@ -120,7 +116,8 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
         chunks = split_plain_text_source(preserved, base_meta)
     else:
         docling_source = prepare_docling_source(preserved)
-        pipeline = build_parsing_pipeline()
+        # Child parser is CPU-only; it must never initialize CUDA/OCR on GPU.
+        pipeline = build_parsing_pipeline(pdf_cpu=True)
         parsed = pipeline.run({"converter": {
             "sources": [str(docling_source)], "meta": base_meta,
         }})

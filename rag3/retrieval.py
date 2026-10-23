@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from typing import Literal
+from typing import Callable, Literal
 
 from haystack import Pipeline
 from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
@@ -113,6 +113,7 @@ def search(
     qdrant_url: str = DEFAULT_QDRANT_URL,
     model_path: str | None = None,
     mode: Mode | None = None,
+    dense_encoder: Callable[[str], list[float]] | None = None,
 ) -> dict:
     " ""Search selected representations; optionally fuse them with Qdrant-native RRF." ""
     if not query or not query.strip():
@@ -155,8 +156,11 @@ def search(
 
     dense_query: list[float] | None = None
     if semantic:
-        embedded = _embed_query(query, model_path)
-        dense_query = list(embedded["embedding"])
+        if dense_encoder is None:
+            embedded = _embed_query(query, model_path)
+            dense_query = list(embedded["embedding"])
+        else:
+            dense_query = list(dense_encoder(query))
 
     bm25_query = None
     if bm25:
