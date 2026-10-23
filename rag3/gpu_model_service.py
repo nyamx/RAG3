@@ -71,6 +71,7 @@ class _Request:
     offset: int = 0
     vectors: list[list[float]] = field(default_factory=list)
     last_queued: float = 0.0
+    document_sequence: int = 0
 
 
 class GPURequest:
@@ -78,6 +79,8 @@ class GPURequest:
 
     cancel() works even after Future.set_running_or_notify_cancel(): an active
     <=8-text GPU call is not interrupted; its result is discarded at boundary.
+    Future callbacks must not synchronously wait for another request on this
+    service, because completion may run on the sole GPU owner thread.
     """
     def __init__(self, service: 'GPUModelService', request: _Request):
         self.future = request.future
@@ -113,8 +116,15 @@ class GPUModelService:
         self._condition = threading.Condition()
         self._queries: deque[_Request] = deque()
         self._documents: deque[_Request] = deque()
+        # A partial document request remains in flight between batches when
+        # the waiting queue is full. This one explicit continuation slot lets
+        # a query enter even with queue_limit=1, without overflowing the queue.
+        self._deferred_document: _Request | None = None
+        self._next_document_sequence = 0
         self._current: _Request | None = None
         self._worker: threading.Thread | None = None
+        self._deadline_worker: threading.Thread | None = None
+        self._reset_query_burst = False
         self._stop = False
         self._state = 'not_initialized'
         self._error_code: str | None = None
@@ -134,6 +144,7 @@ class GPUModelService:
         with self._condition:
             return dict(state=self._state, scope='stage_b_service_only',
                         query_waiting=len(self._queries), document_waiting=len(self._documents),
+                        document_deferred=self._deferred_document is not None,
                         active_kind=self._current.kind if self._current else None,
                         error_code=self._error_code, error_summary=self._error_summary,
                         model_load_count=self._model_load_count)
@@ -191,20 +202,68 @@ class GPUModelService:
                                       'GPU service is in failed state')
             if len(self._queries) + len(self._documents) >= self.config.queue_limit:
                 raise GPUServiceError('QUEUE_FULL', 'GPU request queue at capacity')
-            (self._queries if kind == 'query' else self._documents).append(req)
+            if kind == 'query':
+                self._queries.append(req)
+            else:
+                self._stamp_document_locked(req)
+                self._documents.append(req)
             if self._worker is None:
                 self._worker = threading.Thread(target=self._run, name='rag3-bge-gpu-owner', daemon=True)
                 self._worker.start()
-            self._condition.notify()
+            if self._deadline_worker is None:
+                # The GPU owner cannot expire Futures while blocked in model
+                # loading or CUDA. One shared timer serves all requests.
+                self._deadline_worker = threading.Thread(
+                    target=self._watch_deadlines, name='rag3-bge-deadlines', daemon=True)
+                self._deadline_worker.start()
+            self._condition.notify_all()
         return GPURequest(self, req)
+
+    def _stamp_document_locked(self, req: _Request):
+        self._next_document_sequence += 1
+        req.document_sequence = self._next_document_sequence
+
+    def _insert_document_locked(self, req: _Request):
+        # The deferred continuation can be older than documents submitted
+        # while a query runs. Restore it at its original FIFO position.
+        for index, queued in enumerate(self._documents):
+            if req.document_sequence < queued.document_sequence:
+                self._documents.insert(index, req)
+                return
+        self._documents.append(req)
 
     def _prune_locked(self, now):
         for queue in (self._queries, self._documents):
             for req in tuple(queue):
-                if req.cancelled or now >= req.deadline:
+                if req.cancelled or now >= req.deadline or req.future.done():
                     queue.remove(req)
                     if not req.future.done():
                         req.future.set_exception(GPURequestCancelled() if req.cancelled else GPURequestExpired())
+        req = self._deferred_document
+        if req is not None and (req.cancelled or now >= req.deadline or req.future.done()):
+            self._deferred_document = None
+            if not req.future.done():
+                req.future.set_exception(GPURequestCancelled() if req.cancelled else GPURequestExpired())
+        req = self._current
+        if req is not None and (req.cancelled or now >= req.deadline) and not req.future.done():
+            # The in-flight CUDA call remains non-preemptible. Its caller is
+            # released at the deadline and the owner discards the late result.
+            req.future.set_exception(GPURequestCancelled() if req.cancelled else GPURequestExpired())
+        if not self._documents and self._deferred_document is None:
+            # A later document starts a fresh contention period. Old queries
+            # cannot consume its priority budget.
+            self._reset_query_burst = True
+
+    def _watch_deadlines(self):
+        with self._condition:
+            while not self._stop and self._state != 'failed':
+                now = self._clock()
+                self._prune_locked(now)
+                pending = (tuple(self._queries) + tuple(self._documents)
+                           + ((self._deferred_document,) if self._deferred_document else ())
+                           + ((self._current,) if self._current else ()))
+                deadlines = [req.deadline for req in pending if not req.future.done()]
+                self._condition.wait(timeout=max(0.0, min(deadlines) - now) if deadlines else None)
 
     def cancel(self, req: _Request) -> bool:
         with self._condition:
@@ -227,16 +286,28 @@ class GPUModelService:
                 for req in tuple(self._queries) + tuple(self._documents):
                     if not req.future.done():
                         req.future.set_exception(GPUServiceError('SERVICE_STOPPED', 'GPU service stopped'))
+                if self._deferred_document and not self._deferred_document.future.done():
+                    self._deferred_document.future.set_exception(
+                        GPUServiceError('SERVICE_STOPPED', 'GPU service stopped'))
                 self._queries.clear()
                 self._documents.clear()
+                self._deferred_document = None
                 if self._current:
                     self._current.cancelled = True
+                    if not self._current.future.done():
+                        # GPU work cannot be interrupted, but callers must not
+                        # wait for a stuck call after service shutdown.
+                        self._current.future.set_exception(
+                            GPUServiceError('SERVICE_STOPPED', 'GPU service stopped'))
                 self._condition.notify_all()
             worker = self._worker
+            deadline_worker = self._deadline_worker
             if self._state != 'failed':
                 self._state = 'stopped'
         if wait and worker and threading.current_thread() is not worker:
             worker.join(timeout)
+        if wait and deadline_worker and threading.current_thread() is not deadline_worker:
+            deadline_worker.join(timeout)
 
     def _load_cuda_model(self):
         from rag3.ingestion_settings import find_bge_m3
@@ -288,10 +359,13 @@ class GPUModelService:
             self._error_code = code
             self._error_summary = summary  # fixed safe strings, no model paths or traceback
             requests = list(self._queries) + list(self._documents)
+            if self._deferred_document:
+                requests.append(self._deferred_document)
             if current:
                 requests.append(current)
             self._queries.clear()
             self._documents.clear()
+            self._deferred_document = None
             self._current = None
             for req in requests:
                 if not req.future.done():
@@ -299,11 +373,29 @@ class GPUModelService:
             self._condition.notify_all()
 
     def _choose_locked(self, burst: int):
-        if self._queries and (burst < self.config.max_query_burst or not self._documents):
-            return self._queries.popleft(), burst + 1
+        documents_waiting = bool(self._documents or self._deferred_document)
+        if self._queries and (burst < self.config.max_query_burst or not documents_waiting):
+            # Queries served while no document waits do not consume fairness.
+            return self._queries.popleft(), burst + 1 if documents_waiting else 0
         if self._documents:
-            return self._documents.popleft(), 0
-        return None, burst
+            if (self._deferred_document is not None
+                    and self._deferred_document.document_sequence
+                    < self._documents[0].document_sequence):
+                req = self._deferred_document
+                self._deferred_document = None
+                return req, 0
+            req = self._documents.popleft()
+            if self._deferred_document:
+                # The freed queue slot restores the older continuation in
+                # sequence order, even if later documents were submitted.
+                self._insert_document_locked(self._deferred_document)
+                self._deferred_document = None
+            return req, 0
+        if self._deferred_document:
+            req = self._deferred_document
+            self._deferred_document = None
+            return req, 0
+        return None, 0
 
     def _run(self):
         self._owner_thread_id = threading.get_ident()
@@ -311,11 +403,15 @@ class GPUModelService:
         while True:
             with self._condition:
                 self._prune_locked(self._clock())
-                while not self._stop and not self._queries and not self._documents and self._state != 'failed':
+                while (not self._stop and not self._queries and not self._documents
+                       and not self._deferred_document and self._state != 'failed'):
                     self._condition.wait()
                     self._prune_locked(self._clock())
                 if self._stop or self._state == 'failed':
                     return
+                if self._reset_query_burst:
+                    burst = 0
+                    self._reset_query_burst = False
                 req, burst = self._choose_locked(burst)
                 self._current = req
                 # set_running occurs only on the first batch. Cooperative cancel
@@ -361,7 +457,7 @@ class GPUModelService:
                 else:
                     self._document_batches.append(len(batch))
                     self._doc_encode_seconds += duration
-            if req.cancelled or self._clock() >= req.deadline or self._stop:
+            if req.future.done() or req.cancelled or self._clock() >= req.deadline or self._stop:
                 self._finish_error(req, GPURequestCancelled() if req.cancelled else GPURequestExpired())
                 continue
             req.vectors.extend(result)
@@ -370,15 +466,24 @@ class GPUModelService:
                 with self._condition:
                     if self._stop:
                         req.cancelled = True
+                    elif req.future.done() or req.cancelled or self._clock() >= req.deadline:
+                        pass
                     else:
                         req.last_queued = self._clock()
-                        self._documents.append(req)  # rotation across document requests
+                        self._stamp_document_locked(req)
+                        if len(self._queries) + len(self._documents) < self.config.queue_limit:
+                            self._documents.append(req)  # rotation across document requests
+                        else:
+                            # Never append beyond queue_limit. A partial active
+                            # document retains one visible continuation slot.
+                            assert self._deferred_document is None
+                            self._deferred_document = req
                     self._current = None
                     self._condition.notify_all()
-                if req.cancelled:
+                if req.cancelled or req.future.done() or self._clock() >= req.deadline:
                     with self._condition:
                         self._prune_locked(self._clock())
-                    self._finish_error(req, GPURequestCancelled())
+                    self._finish_error(req, GPURequestCancelled() if req.cancelled else GPURequestExpired())
             else:
                 with self._condition:
                     self._current = None

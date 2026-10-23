@@ -5,6 +5,7 @@ import math
 import sys
 import threading
 import unittest
+from collections import deque
 from concurrent.futures import TimeoutError
 from pathlib import Path
 
@@ -102,11 +103,43 @@ class ServiceTest(unittest.TestCase):
             for handle in queries + [doc, active]:
                 handle.result(timeout=4)
             order = [a[0] for a in b.calls]
-            self.assertEqual(order[:4], ['q', 'q', 'q', 'd'])
+            # The active "hold" query began while no document waited; only
+            # subsequent queries consume the fairness burst.
+            self.assertEqual(order[:5], ['q', 'q', 'q', 'q', 'd'])
             self.assertEqual([a[2][0] for a in b.calls if a[0] == 'q'],
                              ['hold'] + [str(i) for i in range(6)])
         finally:
             b.release.set(); s.close()
+
+    def test_uncontended_query_history_does_not_consume_priority(self):
+        hold_entered, release_hold = threading.Event(), threading.Event()
+        calls = []
+        lock = threading.Lock()
+
+        def encode(_model, texts, *, query, **_):
+            with lock:
+                calls.append(('q' if query else 'd', texts[0]))
+            if query and texts == ['hold']:
+                hold_entered.set()
+                if not release_hold.wait(5):
+                    raise AssertionError('held query was not released')
+            return [[1.0] for _ in texts]
+
+        s = service(encode, max_query_burst=2)
+        try:
+            s.submit_query('historical').result(timeout=4)
+            hold = s.submit_query('hold')
+            self.assertTrue(hold_entered.wait(2))
+            document = s.submit_documents(['doc'])
+            fresh_query = s.submit_query('fresh')
+            release_hold.set()
+            for request in (hold, fresh_query, document):
+                request.result(timeout=4)
+            self.assertEqual(calls,
+                             [('q', 'historical'), ('q', 'hold'),
+                              ('q', 'fresh'), ('d', 'doc')])
+        finally:
+            release_hold.set(); s.close()
 
     def test_document_round_robin(self):
         b = Blocker()
@@ -121,6 +154,78 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual([v[1] for v in b.calls], [8, 8, 8, 1, 1])
         finally:
             b.release.set(); s.close()
+
+    def test_two_documents_rotate_with_queue_limit_one(self):
+        first_entered, release_first = threading.Event(), threading.Event()
+        calls = []
+        queue_sizes = []
+
+        def encode(_model, texts, *, query, **_):
+            self.assertFalse(query)
+            calls.append((texts[0], len(texts)))
+            if len(calls) == 1:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise AssertionError('first document batch was not released')
+            return [[1.0 if text == 'a' else 2.0] for text in texts]
+
+        s = service(encode, queue_limit=1)
+
+        class ObservedDocuments(deque):
+            def append(self, request):
+                super().append(request)
+                queue_sizes.append(len(s._queries) + len(s._documents))
+
+        s._documents = ObservedDocuments()
+        try:
+            a = s.submit_documents(['a'] * 17)
+            self.assertTrue(first_entered.wait(2))
+            b = s.submit_documents(['b'] * 9)
+            release_first.set()
+            self.assertEqual(a.result(timeout=4), [[1.0]] * 17)
+            self.assertEqual(b.result(timeout=4), [[2.0]] * 9)
+            self.assertEqual(calls, [('a', 8), ('b', 8), ('a', 8),
+                                     ('b', 1), ('a', 1)])
+            self.assertLessEqual(max(queue_sizes), 1)
+            self.assertFalse(s.snapshot()['document_deferred'])
+        finally:
+            release_first.set(); s.close()
+
+    def test_deferred_document_precedes_later_document(self):
+        first_entered, release_first = threading.Event(), threading.Event()
+        query_entered, release_query = threading.Event(), threading.Event()
+        calls = []
+
+        def encode(_model, texts, *, query, **_):
+            calls.append(('q' if query else texts[0], len(texts)))
+            if len(calls) == 1:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise AssertionError('first document batch was not released')
+            elif query:
+                query_entered.set()
+                if not release_query.wait(5):
+                    raise AssertionError('query was not released')
+            value = 0.0 if query else (1.0 if texts[0] == 'a' else 2.0)
+            return [[value] for _ in texts]
+
+        s = service(encode, queue_limit=1)
+        try:
+            a = s.submit_documents(['a'] * 17)
+            self.assertTrue(first_entered.wait(2))
+            query = s.submit_query('query')
+            release_first.set()
+            self.assertTrue(query_entered.wait(2))
+            self.assertTrue(s.snapshot()['document_deferred'])
+            b = s.submit_documents(['b'] * 9)
+            release_query.set()
+            self.assertEqual(query.result(timeout=4), [0.0])
+            self.assertEqual(a.result(timeout=4), [[1.0]] * 17)
+            self.assertEqual(b.result(timeout=4), [[2.0]] * 9)
+            self.assertEqual(calls, [('a', 8), ('q', 1), ('a', 8),
+                                     ('b', 8), ('a', 1), ('b', 1)])
+        finally:
+            release_first.set(); release_query.set(); s.close()
 
     def test_saturation_and_cancel_queued(self):
         b = Blocker()
@@ -156,6 +261,84 @@ class ServiceTest(unittest.TestCase):
             self.assertNotIn('old', [x[2][0] for x in b.calls])
         finally:
             b.release.set(); s.close()
+
+    def test_queued_deadline_completes_future_while_factory_is_blocked(self):
+        loading, release_factory = threading.Event(), threading.Event()
+        encoded = []
+
+        def factory():
+            loading.set()
+            if not release_factory.wait(5):
+                raise AssertionError('model factory was not released')
+            return object()
+
+        def encode(_model, texts, *, query, **_):
+            encoded.extend(texts)
+            return [[1.0] for _ in texts]
+
+        s = service(encode, factory=factory)
+        try:
+            active = s.submit_query('active', deadline_seconds=.09)
+            self.assertTrue(loading.wait(2))
+            queued = s.submit_query('expired', deadline_seconds=.03)
+            # Deliberately use Future.result, without GPURequest.result or another
+            # submission. The service itself must retire both the queued request
+            # and the active request, even while the model factory is blocked.
+            with self.assertRaises(GPURequestExpired):
+                queued.future.result(timeout=2)
+            with self.assertRaises(GPURequestExpired):
+                active.future.result(timeout=2)
+            self.assertEqual(s.snapshot()['query_waiting'], 0)
+            self.assertNotIn('expired', encoded)
+            release_factory.set()
+        finally:
+            release_factory.set(); s.close()
+        self.assertEqual(encoded, [])
+
+    def test_document_continuation_never_exceeds_waiting_limit(self):
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        query_entered = threading.Event()
+        release_query = threading.Event()
+        calls = []
+        queue_sizes = []
+
+        def encode(_model, texts, *, query, **_):
+            calls.append(('q' if query else 'd', len(texts)))
+            if len(calls) == 1:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise AssertionError('first document batch was not released')
+            elif query:
+                query_entered.set()
+                if not release_query.wait(5):
+                    raise AssertionError('query was not released')
+            return [[1.0] for _ in texts]
+
+        s = service(encode, queue_limit=1)
+
+        class ObservedDocuments(deque):
+            def append(self, request):
+                super().append(request)
+                # append executes under the service Condition. This records the
+                # otherwise invisible instant before the owner pops the next job.
+                queue_sizes.append(len(s._queries) + len(s._documents))
+
+        s._documents = ObservedDocuments()
+        try:
+            document = s.submit_documents(['doc'] * 17)
+            self.assertTrue(first_entered.wait(2))
+            query = s.submit_query('query')
+            release_first.set()
+            self.assertTrue(query_entered.wait(2))
+            self.assertTrue(s.snapshot()['document_deferred'])
+            self.assertLessEqual(max(queue_sizes), 1)
+            release_query.set()
+            self.assertEqual(query.result(timeout=4), [1.0])
+            self.assertEqual(len(document.result(timeout=4)), 17)
+            self.assertEqual(calls, [('d', 8), ('q', 1), ('d', 8), ('d', 1)])
+        finally:
+            release_first.set(); release_query.set(); s.close()
 
     def test_running_cancel_stops_following_batch(self):
         b = Blocker()
@@ -222,6 +405,19 @@ class ServiceTest(unittest.TestCase):
             with self.assertRaises(GPUServiceError):
                 req.future.result(timeout=4)
         s.close()
+
+    def test_close_without_wait_releases_active_future_before_gpu_returns(self):
+        blocker = Blocker()
+        s = service(blocker)
+        try:
+            active = s.submit_query('active')
+            self.assertTrue(blocker.entered.wait(2))
+            s.close(wait=False)
+            self.assertFalse(blocker.release.is_set())
+            with self.assertRaisesRegex(GPUServiceError, 'SERVICE_STOPPED'):
+                active.future.result(timeout=.5)
+        finally:
+            blocker.release.set(); s.close()
 
     def test_input_and_deadline_bounds(self):
         s = service(lambda *_args, **_kwargs: [], max_document_texts=17)
