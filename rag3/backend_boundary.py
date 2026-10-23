@@ -327,7 +327,7 @@ def issue_ui_token(root: Path, port: int) -> str:
     return token
 
 
-def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: str):
+def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: str, gpu_model_service=None):
     """Add HTTP routes to the *same* MCP Starlette server instance.
 
     Custom routes bypass MCP SDK authorization, so the UI endpoint has its own
@@ -345,10 +345,16 @@ def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: s
             except OSError:
                 return 'unreachable'
         status = await asyncio.to_thread(qdrant_transport)
+        gpu = (gpu_model_service.snapshot() if gpu_model_service is not None else
+               {'state': 'not_initialized', 'scope': 'stage_b_service_only',
+                'query_waiting': 0, 'document_waiting': 0,
+                'active_kind': None, 'error_code': None, 'error_summary': None,
+                'model_load_count': 0})
         return JSONResponse({'backend': 'ready', 'pid': os.getpid(),
                              'qdrant_transport': status,
-                             'gpu_model': 'not_initialized' if 'torch' not in sys.modules
-                             else 'module_imported_state_unverified'})
+                             'gpu_model': gpu['state'],
+                             'gpu_model_scope': 'stage_b_service_only_legacy_paths_independent',
+                             'gpu_model_service': gpu})
 
     @mcp.custom_route('/api/v1/command', methods=['POST'], include_in_schema=False)
     async def command(request: Request):

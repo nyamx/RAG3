@@ -34,6 +34,7 @@ from rag3.collections import (collection_contents, create_collection,
                               delete_collections, delete_document,
                               get_document, list_collections, update_chunk_sections)
 from rag3.mcp_jobs import JobManager
+from rag3.gpu_model_service import GPUModelService
 from rag3.sources import SourceError, render_page, source_metadata, source_part
 
 QDRANT_URL = os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL)
@@ -41,6 +42,8 @@ _SESSION_COLLECTIONS = SessionCollections(os.environ.get("RAG3_COLLECTION", DEFA
 _CALL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("rag3_session", default="direct-call")
 _CALL_COLLECTION: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag3_collection", default=None)
 JOBS = JobManager(qdrant_url=QDRANT_URL)
+# Stage B owner; existing retrieval/ingestion uses legacy direct BGE until C/D.
+GPU_BGE_SERVICE = GPUModelService()
 # First backend use imports the local parsing/embedding stack (~45s on this PC).
 # Keep the limit below the Secure MCP Tunnel's 120-second request deadline.
 TOOL_TIMEOUT_SECONDS = 90.0
@@ -1013,7 +1016,8 @@ def _ui_command(action: str, p: dict) -> dict:
 def _register_backend_routes(port: int) -> str:
     token = issue_ui_token(ROOT, port)
     install_routes(mcp, root=ROOT, qdrant_url=QDRANT_URL,
-                   ui_commands=_ui_command, ui_token=token)
+                   ui_commands=_ui_command, ui_token=token,
+                   gpu_model_service=GPU_BGE_SERVICE)
     return token
 
 

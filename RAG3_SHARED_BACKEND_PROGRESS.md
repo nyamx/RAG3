@@ -45,3 +45,42 @@ Baseline: `codex/shared-backend`, HEAD before work `e886e04`. Existing untracked
 - Backups were created under `artifacts/backups/shared-backend-A-*`.
 - Existing `data/`, collections, source files and previously untracked artifacts must not be deleted.
 - The A changes are additive and can be reverted by restoring the above backup and the original MCP server entry point; do not roll back C/D data with old code once their schema changes land.
+
+## Stage B — isolated GPU model service acceptance PASS (2026-10-23 21:30 KST)
+
+### Baseline and scope
+- Branch: `codex/shared-backend`; prior HEAD: `f08e67c`. B-only commit containing this record: resolve with `git log -1 --format=%H` on this branch (the commit hash cannot be embedded in its own content without changing it).
+- Changed: `rag3/gpu_model_service.py` (new), `rag3/bge_dense.py` (new), `rag3/haystack_native.py`, `rag3/backend_boundary.py`, `scripts/rag3-mcp-server.py`, `scripts/test-shared-backend-B-gpu-service.py` (new), `scripts/test-shared-backend-B-real-gpu.py` (new), this progress file.
+- Existing untracked materials, Qdrant collections, source files and ingestion SQLite DB were not edited, deleted or cleaned. Only Stage B code + documentation committed.
+
+### Implementation and API
+- One `GPUModelService` is constructed by the backend; construction/import/repeated `/health` uses no torch, FlagEmbedding, Docling or OCR and loads no model. `/health.gpu_model` and `/health.gpu_model_service` report the **Stage B service only**, not all legacy GPU usage, without absolute model paths or tracebacks. Status includes `not_initialized`, `loading`, `ready`, `failed`, pending query/doc counts, safe error code and summary.
+- `submit_query(text, deadline_seconds=None, deadline_monotonic=None)` returns `GPURequest`, whose `result(timeout=None)` yields a dense vector; `submit_documents(texts, ...)` yields ordered vectors. Request has `.future` and cooperative `.cancel()`. Service exposes `.snapshot()`, `.metrics()`, `.close(wait=True, timeout=None)`. `GPUServiceError.code` is stable (`INVALID_ARGUMENT`, `QUEUE_FULL`, `DEADLINE_EXCEEDED`, `CANCELLED`, `GPU_INIT_FAILED`, `GPU_EXECUTION_FAILED`, `CUDA_OOM`, etc.).
+- The owner thread is lazy and unique. First work loads the fixed local BGE-M3 into `cuda:0` exactly once. FlagEmbedding initially creates CPU-located parameters even when `devices='cuda:0'`; same model is explicitly moved to GPU once, then verified on device. No secondary CPU model, CPU fallback, device shuttling or cache-emptying.
+- Shared `rag3.bge_dense.encode_dense` preserves query `encode_queries` vs document `encode_corpus`, float32 dense L2 normalization, vector order and disabled sparse/ColBERT. Legacy `BGEM3OnePassEmbedder` uses the same helper but its model ownership remains unchanged until C/D.
+- Two `deque` queues under `threading.Condition`, Future-based responses. Actual model calls are <= 8 documents at a time; documents rotate to the end of the document queue per batch. Waiting queries have batch-boundary priority limited by a three-query burst before a waiting doc batch. Query/doc GPU calls never hold the Condition lock. No Qdrant I/O or CPU parsing in this owner.
+- Submitted requests carry monotonic absolute deadlines including load/queue/inference. Pending cancellations/expirations release queue capacity; a running <=8 batch is non-preemptible but its result is discarded on cancellation/deadline and remaining batches are skipped. Fatal GPU load/encode errors fail all outstanding Futures and latch `failed` until restart; no retry storm or silent CPU downgrade.
+
+### Config defaults and their evidence/limits
+- `RAG3_GPU_BATCH_SIZE=8` (hard maximum 8): existing ingestion BGE internal batch size and deterministic 17-doc `8,8,1` test.
+- `RAG3_GPU_QUEUE_LIMIT=32` waiting requests; `RAG3_GPU_MAX_DOC_TEXTS=256` per document request; `RAG3_GPU_MAX_TEXT_CHARS=16384` per text; these are explicit defensive memory bounds, **not** tuned from production concurrency/load benchmarks. Active request is accounted separately.
+- `RAG3_GPU_QUERY_BURST=3` maximum consecutive query batches while documents wait: deterministic starvation/FIFO verification, not latency-optimized.
+- `RAG3_GPU_DEADLINE_SECONDS=180` including lazy model load; service-level default, not yet validated against production p95; real GPU acceptance used an explicit 300s safety deadline.
+- `GPUServiceConfig.max_length=8192` retains previous BGE max token length. Model path comes only from fixed local `find_bge_m3()`; arbitrary request-side paths are not accepted. Invalid/nonfinite deadlines and oversized inputs are rejected.
+
+### Acceptance on target Windows venv
+- `.venv\Scripts\python.exe scripts\test-shared-backend-B-gpu-service.py`: **PASS 15/15**; injected fake model/synchronization/clock covers one owner, 17-doc interleaving with query, 8-call boundaries, FIFO/rotation, query burst bound, input/queue limits, deadline while loading/in queued work, cancellation while running, stop behavior, load failure and CUDA OOM.
+- `.venv\Scripts\python.exe -c <cold health smoke embedded in Bridge finalization>`: **PASS**; 3 health calls, heavy imports=0, model load=0; no A-stage integration regression suite rerun per instruction.
+- `.venv\Scripts\python.exe scripts\test-shared-backend-B-real-gpu.py`: **PASS**, isolated B-only process, device `Quadro T1000`, actual parameters `cuda:0`, `BGEM3FlagModel` instance/model load count **1**, owner thread ID `74392`, query/17-doc/second query; dense 1024, norms ~1, document actual call sizes `[8, 8, 1]`. No CPU fallback.
+- Legacy `rag3/retrieval.py`: unchanged. Static branch guard confirms BM25-only `semantic=False` does not call `_embed_query`; previous Stage A mock BM25 verification exists, but live BM25 search **not rerun** in B. Live Qdrant mutation: **not performed**.
+- `git diff --check` and `git diff --cached --check`: PASS (checked before commit).
+
+### Measurements (single isolated run, not load benchmarks)
+- GPU model first load `20.563 s`; aggregate queue wait `0.000 s` (sequential requests, **not** a contended-queue latency benchmark).
+- Aggregate query encoding (2 calls) `0.750 s`; aggregate document encoding (3 batches / 17 docs) `1.484 s`. CPU parsing: **미측정**; Qdrant I/O: **미측정**.
+- Process RSS before `577.1 MiB`, after `2690.1 MiB`. Device VRAM total `4095.7 MiB`, available before `3298.5 MiB`, available after `2166.5 MiB`, observed decline `1132.0 MiB`. These are process/container snapshots, not per-component allocation accounting.
+- Separate Bridge evidence: implementation `run_output_20261023_210522_692.zip`, initial GPU fault `run_output_20261023_210900_461.zip`, CUDA ownership fix / successful GPU `run_output_20261023_211504_764.zip`, hardened 15 tests and cold health `run_output_20261023_211911_463.zip`, audit `run_output_20261023_212144_156.zip`; final run output provides new measured numbers.
+
+### Remaining paths and next Stage C action
+- `rag3/retrieval.py` still has `_QUERY_EMBEDDERS` and `build_retrieval_pipeline` direct BGE initialization; `scripts/ingest-worker.py` continues to create its own embedder and submit 32 texts to its own `_encode`, and UI search worker/MCP semantic search have not been migrated. Hence real operation **can still instantiate multiple BGE models**. Stage B completion proves only isolated B service semantics and GPU residency, not shared end-to-end model, concurrent ingestion/search or finalized process topology.
+- Start C by inspecting live ingestion activity, SQLite job state/checkpoints and consistency of an intact backup **before** any scheduler/worker transition. Then connect ingestion embedding to the B service via the backend's own process, validate temporary collections only, and reconcile cancellation/deadline semantics. Do not alter existing collections or live jobs during these preparations. UI/MCP service integration remains D.

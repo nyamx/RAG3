@@ -461,28 +461,9 @@ class BGEM3OnePassEmbedder:
         self.warm_up()
         if self._model is None:
             raise RuntimeError("BGE-M3 model did not initialize")
-
-        kwargs = dict(
-            batch_size=self.batch_size,
-            max_length=self.max_length,
-            return_dense=True,
-            return_sparse=False,
-            return_colbert_vecs=False,
-        )
-        if query and hasattr(self._model, "encode_queries"):
-            out = self._model.encode_queries(texts, **kwargs)
-        elif hasattr(self._model, "encode_corpus"):
-            out = self._model.encode_corpus(texts, **kwargs)
-        else:
-            out = self._model.encode(texts, **kwargs)
-
-        dense_arr = np.asarray(out["dense_vecs"], dtype=np.float32)
-        if dense_arr.ndim == 1:
-            dense_arr = dense_arr.reshape(1, -1)
-        norms = np.linalg.norm(dense_arr, axis=1, keepdims=True)
-        dense_arr = dense_arr / np.where(norms == 0.0, 1.0, norms)
-
-        return dense_arr.tolist()
+        from rag3.bge_dense import encode_dense
+        return encode_dense(self._model, texts, query=query,
+                            batch_size=self.batch_size, max_length=self.max_length)
 
     @component.output_types(
         documents=list[Document],
