@@ -6,6 +6,7 @@ import binascii
 import contextvars
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -919,19 +920,57 @@ async def rag3_delete_document(collection: str, document_id: str,
 
 
 
+def _ui_text(p: dict, key: str) -> str:
+    value = p.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{key} must be a nonempty string')
+    return value
+
+
+def _ui_number(p: dict, key: str, default: float, minimum: float, maximum: float,
+               *, exclusive_minimum: bool = False) -> float:
+    value = p.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f'{key} must be a finite number')
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{key} must be a finite number') from exc
+    if not math.isfinite(number):
+        raise ValueError(f'{key} must be a finite number')
+    if (number <= minimum if exclusive_minimum else number < minimum) or number > maximum:
+        raise ValueError(f'{key} is outside its supported range')
+    return number
+
+
+def _ui_nonnegative_int(p: dict, key: str, default: int) -> int:
+    value = p.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f'{key} must be a nonnegative integer')
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{key} must be a nonnegative integer') from exc
+    if number < 0 or str(value).strip() != str(number):
+        raise ValueError(f'{key} must be a nonnegative integer')
+    return number
+
+
 def _ui_command(action: str, p: dict) -> dict:
     'A-stage compatibility gateway; C replaces manager RPC, D migrates the UI.'
     if action == 'collections.list':
         return {'collections': list_collections(url=QDRANT_URL)}
     if action == 'collections.contents':
-        return collection_contents(_collection_name(p['collection']), url=QDRANT_URL)
+        return collection_contents(_collection_name(_ui_text(p, 'collection')), url=QDRANT_URL)
     if action == 'collections.create':
-        return create_collection(_collection_name(p['collection']), url=QDRANT_URL,
-                                 bm25_k=float(p.get('bm25_k', 1.2)),
-                                 bm25_b=float(p.get('bm25_b', .75)),
-                                 bm25_avg_len=float(p.get('bm25_avg_len', 256)))
+        return create_collection(_collection_name(_ui_text(p, 'collection')), url=QDRANT_URL,
+                                 bm25_k=_ui_number(p, 'bm25_k', 1.2, 0, 100,
+                                                   exclusive_minimum=True),
+                                 bm25_b=_ui_number(p, 'bm25_b', .75, 0, 1),
+                                 bm25_avg_len=_ui_number(p, 'bm25_avg_len', 256, 1, 100000),
+                                 reuse_existing=True)
     if action == 'collections.delete_many':
-        names = p['collections']
+        names = p.get('collections')
         if (not isinstance(names, list) or not names or
                 any(not isinstance(n, str) for n in names) or len(names) != len(set(names)) or
                 p.get('confirm_collections') != names):
@@ -941,22 +980,33 @@ def _ui_command(action: str, p: dict) -> dict:
             raise ValueError('Cannot delete collections with active ingestion jobs')
         return delete_collections(validated, url=QDRANT_URL)
     if action == 'search':
-        return _locked_search(p['query'], p.get('options'), _collection_name(p['collection']))
+        options = p.get('options')
+        if options is not None and not isinstance(options, dict):
+            raise ValueError('options must be an object')
+        return _locked_search(_ui_text(p, 'query'), options,
+                              _collection_name(_ui_text(p, 'collection')))
     if action == 'jobs.list':
-        return JOBS.list(p.get('collection', ''), p.get('status', ''),
-                         int(p.get('limit', 50)), int(p.get('offset', 0)))
+        collection, status = p.get('collection', ''), p.get('status', '')
+        if not isinstance(collection, str) or not isinstance(status, str):
+            raise ValueError('collection and status must be strings')
+        limit = _ui_nonnegative_int(p, 'limit', 50)
+        offset = _ui_nonnegative_int(p, 'offset', 0)
+        if not 1 <= limit <= 200:
+            raise ValueError('limit must be 1..200')
+        return JOBS.list(collection, status, limit, offset)
     if action == 'jobs.status':
-        return JOBS.status(p['job_id'])
+        return JOBS.status(_ui_text(p, 'job_id'))
     if action == 'jobs.submit':
         from rag3.ingestion_manager import client as manager_client
-        return manager_client('submit', origin='UI', collection=_collection_name(p['collection']),
-                              path=p['path'], requested=False)
+        return manager_client('submit', origin='UI',
+                              collection=_collection_name(_ui_text(p, 'collection')),
+                              path=_ui_text(p, 'path'), requested=False)
     if action == 'jobs.action':
-        operation = p['operation']
+        operation = _ui_text(p, 'operation')
         if operation not in {'run', 'pause', 'resume', 'retry', 'cancel', 'hide', 'restart'}:
             raise ValueError('Invalid job operation')
         from rag3.ingestion_manager import client as manager_client
-        return manager_client('action', job_id=p['job_id'], operation=operation)
+        return manager_client('action', job_id=_ui_text(p, 'job_id'), operation=operation)
     raise ValueError('Unknown UI API action')
 
 
