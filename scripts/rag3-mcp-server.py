@@ -22,21 +22,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.server import Context
 from mcp.server.apps import Apps, ResourceCsp
 from mcp.server.mcpserver.resources.types import TextResource
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
 from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
+from rag3.backend_boundary import SessionCollections, session_identifier, install_routes, issue_ui_token, single_instance
 from rag3.collections import (collection_contents, create_collection,
                               delete_collections, delete_document,
                               get_document, list_collections, update_chunk_sections)
 from rag3.mcp_jobs import JobManager
 from rag3.sources import SourceError, render_page, source_metadata, source_part
 
-COLLECTION = os.environ.get("RAG3_COLLECTION", DEFAULT_NATIVE_COLLECTION)
 QDRANT_URL = os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL)
-_COLLECTION_LOCK = threading.RLock()
-_COLLECTION_INITIALIZED = False
+_SESSION_COLLECTIONS = SessionCollections(os.environ.get("RAG3_COLLECTION", DEFAULT_NATIVE_COLLECTION))
+_CALL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("rag3_session", default="direct-call")
 _CALL_COLLECTION: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag3_collection", default=None)
 JOBS = JobManager(qdrant_url=QDRANT_URL)
 # First backend use imports the local parsing/embedding stack (~45s on this PC).
@@ -447,16 +448,20 @@ def _fetch_impl(ref_id: str, offset: int) -> dict:
     return body
 
 
-async def _timed_call(fn, *args):
+async def _timed_call(fn, *args, session_key: str | None = None):
+    token = _CALL_SESSION.set(session_key) if session_key is not None else None
     try:
         return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=TOOL_TIMEOUT_SECONDS)
     except TimeoutError as exc:
         raise ToolFailure("TIMEOUT", f"Tool execution exceeded {int(TOOL_TIMEOUT_SECONDS)} seconds.", True) from exc
+    finally:
+        if token is not None:
+            _CALL_SESSION.reset(token)
 
 
-async def _run_tool(fn, *args) -> CallToolResult:
+async def _run_tool(fn, *args, session_key: str | None = None) -> CallToolResult:
     try:
-        value = await _timed_call(fn, *args)
+        value = await _timed_call(fn, *args, session_key=session_key)
         return value if isinstance(value, CallToolResult) else _ok(value)
     except ToolFailure as exc:
         return _error(exc.code, exc.message, exc.retryable)
@@ -484,23 +489,15 @@ def _collection_name(name: str) -> str:
 
 
 def _selected_collection(*, required: bool = True, available: list[str] | None = None) -> str | None:
-    """Resolve configured selection once; subsequently invalidate deleted selections.
-
-    Never silently switch a live server to a different collection after deletion.
-    """
-    global COLLECTION, _COLLECTION_INITIALIZED
     existing = available if available is not None else list_collections(url=QDRANT_URL)
-    with _COLLECTION_LOCK:
-        if not _COLLECTION_INITIALIZED:
-            if COLLECTION not in existing:
-                COLLECTION = existing[0] if len(existing) == 1 else None
-            _COLLECTION_INITIALIZED = True
-        elif COLLECTION is not None and COLLECTION not in existing:
-            COLLECTION = None
-        selected = COLLECTION
+    selected = _SESSION_COLLECTIONS.get(_CALL_SESSION.get(), existing)
     if required and selected is None:
         raise ToolFailure("COLLECTION_NOT_SELECTED", "No valid collection selected. Use rag3_select_collection.", False)
     return selected
+
+
+def _session_key(ctx: Context) -> str:
+    return session_identifier(ctx)
 
 
 SOURCE_VIEW_URI = "ui://rag3/original-source-v9.html"
@@ -532,8 +529,8 @@ def _locked_search(query: str, options: dict | None = None, collection: str | No
         _CALL_COLLECTION.reset(token)
 
 
-def _locked_fetch(ref_id: str, offset: int) -> dict:
-    selected = _selected_collection()
+def _locked_fetch(ref_id: str, offset: int, collection: str | None = None) -> dict:
+    selected = _collection_name(collection) if collection else _selected_collection()
     token = _CALL_COLLECTION.set(selected)
     try:
         return _fetch_impl(ref_id, offset)
@@ -557,9 +554,11 @@ def _locked_fetch(ref_id: str, offset: int) -> dict:
 )
 async def rag3_search(
     query: Annotated[str, Field(min_length=1, max_length=2000)],
+    ctx: Context,
+    collection: str = "",
 ) -> Annotated[CallToolResult, SearchOutput]:
     try:
-        return _ok(await _timed_call(_locked_search, query))
+        return _ok(await _timed_call(_locked_search, query, None, collection or None, session_key=_session_key(ctx)))
     except ToolFailure as exc:
         return _error(exc.code, exc.message, exc.retryable)
 
@@ -580,10 +579,12 @@ async def rag3_search(
 )
 async def rag3_fetch(
     id: Annotated[str, Field(min_length=1, max_length=2048)],
+    ctx: Context,
     offset: Annotated[StrictInt, Field(ge=0)] = 0,
+    collection: str = "",
 ) -> Annotated[CallToolResult, FetchOutput]:
     try:
-        return _ok(await _timed_call(_locked_fetch, id, offset))
+        return _ok(await _timed_call(_locked_fetch, id, offset, collection or None, session_key=_session_key(ctx)))
     except ToolFailure as exc:
         return _error(exc.code, exc.message, exc.retryable)
 
@@ -594,10 +595,12 @@ async def rag3_fetch(
           annotations=READ_ONLY, structured_output=True)
 async def rag3_search_advanced(
     query: Annotated[str, Field(min_length=1, max_length=2000)],
+    ctx: Context,
     semantic: StrictBool = True,
     bm25: StrictBool = True,
     rank_fusion: StrictBool = True,
     top_k: Annotated[StrictInt, Field(ge=1, le=100)] = 10,
+    collection: str = "",
 ) -> Annotated[CallToolResult, SearchOutput]:
     if not any((semantic, bm25)):
         return _error("INVALID_ARGUMENT", "Select at least one retrieval method.")
@@ -606,7 +609,7 @@ async def rag3_search_advanced(
     return await _run_tool(_locked_search, query, {
         "semantic": semantic, "bm25": bm25,
         "rank_fusion": rank_fusion, "top_k": top_k,
-    })
+    }, collection or None, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_search_flexible", title="RAG3 범용 검색",
@@ -625,6 +628,7 @@ async def rag3_search_advanced(
           annotations=READ_ONLY, structured_output=True)
 async def rag3_search_flexible(
     query: Annotated[str, Field(min_length=1, max_length=2000)],
+    ctx: Context,
     metadata_filter: dict[str, Any] | None = None,
     collection: str = "",
     semantic: StrictBool = True,
@@ -643,34 +647,31 @@ async def rag3_search_flexible(
         "semantic": semantic, "bm25": bm25,
         "rank_fusion": rank_fusion, "top_k": top_k,
         "candidate_k": candidate_k, "metadata_filter": metadata_filter,
-    }, collection or None)
+    }, collection or None, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_list_collections", title="RAG3 컬렉션 목록",
           description="List Qdrant collections and show the current server selection.",
           annotations=READ_ONLY, structured_output=True)
-async def rag3_list_collections() -> Annotated[CallToolResult, dict[str, Any]]:
+async def rag3_list_collections(ctx: Context) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
         available = list_collections(url=QDRANT_URL)
         return {"collections": available,
                 "selected": _selected_collection(required=False, available=available)}
-    return await _run_tool(run)
+    return await _run_tool(run, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_select_collection", title="RAG3 컬렉션 선택",
           description="Select the collection for subsequent search and fetch calls on this server process.",
           annotations=WRITE, structured_output=True)
-async def rag3_select_collection(collection: str) -> Annotated[CallToolResult, dict[str, Any]]:
+async def rag3_select_collection(collection: str, ctx: Context) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
-        global COLLECTION, _COLLECTION_INITIALIZED
         name = _collection_name(collection)
         if name not in list_collections(url=QDRANT_URL):
             raise ValueError(f"collection does not exist: {name}")
-        with _COLLECTION_LOCK:
-            COLLECTION = name
-            _COLLECTION_INITIALIZED = True
+        _SESSION_COLLECTIONS.select(_CALL_SESSION.get(), name)
         return {"selected": name}
-    return await _run_tool(run)
+    return await _run_tool(run, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_create_collection", title="RAG3 컬렉션 생성",
@@ -693,7 +694,7 @@ async def rag3_create_collection(
 @mcp.tool(name="rag3_delete_collection", title="RAG3 컬렉션 삭제",
           description="Permanently delete one collection. confirm_collection must exactly match collection.",
           annotations=DELETE, structured_output=True)
-async def rag3_delete_collection(collection: str, confirm_collection: str) -> Annotated[CallToolResult, dict[str, Any]]:
+async def rag3_delete_collection(collection: str, confirm_collection: str, ctx: Context) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
         _require_write(destructive=True)
         name = _collection_name(collection)
@@ -704,7 +705,7 @@ async def rag3_delete_collection(collection: str, confirm_collection: str) -> An
         if JOBS.has_active_collection(name):
             raise ValueError("collection has an active ingestion job")
         return delete_collections([name], url=QDRANT_URL)
-    return await _run_tool(run)
+    return await _run_tool(run, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_ingest_file", title="RAG3 파일 수집",
@@ -845,9 +846,9 @@ async def rag3_update_chunk_metadata(
           annotations=READ_ONLY, structured_output=True,
           meta={"ui": {"resourceUri": SOURCE_VIEW_URI, "visibility": ["model", "app"]},
                 "openai/outputTemplate": SOURCE_VIEW_URI})
-async def rag3_get_source(document_id: str, collection: str = "") -> Annotated[CallToolResult, dict[str, Any]]:
+async def rag3_get_source(document_id: str, ctx: Context, collection: str = "") -> Annotated[CallToolResult, dict[str, Any]]:
     return await _run_tool(lambda: source_metadata(collection or _selected_collection(),
-                                                    document_id, url=QDRANT_URL))
+                                                    document_id, url=QDRANT_URL), session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_read_source_part", title="RAG3 원본 전송",
@@ -885,6 +886,7 @@ def read_source_part(collection: str, document_id: str, offset: int) -> dict:
           meta={"ui": {"resourceUri": SOURCE_VIEW_URI, "visibility": ["model", "app"]},
                 "openai/outputTemplate": SOURCE_VIEW_URI})
 async def rag3_get_page(document_id: str, page: Annotated[StrictInt, Field(ge=1)],
+                        ctx: Context,
                         collection: str = "",
                         max_dimension: Annotated[StrictInt, Field(ge=512, le=3000)] = 2000,
                         ) -> Annotated[CallToolResult, dict[str, Any]]:
@@ -897,7 +899,7 @@ async def rag3_get_page(document_id: str, page: Annotated[StrictInt, Field(ge=1)
         result.content.append(ImageContent(type="image", mimeType="image/jpeg", data=encoded))
         result.meta = {"rag3/pageImage": {"mime_type": "image/jpeg", "data": encoded}}
         return result
-    return await _run_tool(run)
+    return await _run_tool(run, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_delete_document", title="RAG3 문서 삭제",
@@ -916,6 +918,58 @@ async def rag3_delete_document(collection: str, document_id: str,
     return await _run_tool(run)
 
 
+
+def _ui_command(action: str, p: dict) -> dict:
+    'A-stage compatibility gateway; C replaces manager RPC, D migrates the UI.'
+    if action == 'collections.list':
+        return {'collections': list_collections(url=QDRANT_URL)}
+    if action == 'collections.contents':
+        return collection_contents(_collection_name(p['collection']), url=QDRANT_URL)
+    if action == 'collections.create':
+        return create_collection(_collection_name(p['collection']), url=QDRANT_URL,
+                                 bm25_k=float(p.get('bm25_k', 1.2)),
+                                 bm25_b=float(p.get('bm25_b', .75)),
+                                 bm25_avg_len=float(p.get('bm25_avg_len', 256)))
+    if action == 'collections.delete_many':
+        names = p['collections']
+        if (not isinstance(names, list) or not names or
+                any(not isinstance(n, str) for n in names) or len(names) != len(set(names)) or
+                p.get('confirm_collections') != names):
+            raise ValueError('Exact confirmation of collections is required')
+        validated = [_collection_name(n) for n in names]
+        if any(JOBS.has_active_collection(n) for n in validated):
+            raise ValueError('Cannot delete collections with active ingestion jobs')
+        return delete_collections(validated, url=QDRANT_URL)
+    if action == 'search':
+        return _locked_search(p['query'], p.get('options'), _collection_name(p['collection']))
+    if action == 'jobs.list':
+        return JOBS.list(p.get('collection', ''), p.get('status', ''),
+                         int(p.get('limit', 50)), int(p.get('offset', 0)))
+    if action == 'jobs.status':
+        return JOBS.status(p['job_id'])
+    if action == 'jobs.submit':
+        from rag3.ingestion_manager import client as manager_client
+        return manager_client('submit', origin='UI', collection=_collection_name(p['collection']),
+                              path=p['path'], requested=False)
+    if action == 'jobs.action':
+        operation = p['operation']
+        if operation not in {'run', 'pause', 'resume', 'retry', 'cancel', 'hide', 'restart'}:
+            raise ValueError('Invalid job operation')
+        from rag3.ingestion_manager import client as manager_client
+        return manager_client('action', job_id=p['job_id'], operation=operation)
+    raise ValueError('Unknown UI API action')
+
+
+def _register_backend_routes(port: int) -> str:
+    token = issue_ui_token(ROOT, port)
+    install_routes(mcp, root=ROOT, qdrant_url=QDRANT_URL,
+                   ui_commands=_ui_command, ui_token=token)
+    return token
+
+
+# Only the lock-owning HTTP process creates a UI token; duplicate starts cannot rotate it.
+
+
 if __name__ == "__main__":
     transport = os.environ.get("RAG3_MCP_TRANSPORT", "streamable-http")
     if transport == "streamable-http":
@@ -924,7 +978,9 @@ if __name__ == "__main__":
             raise ValueError("RAG3_MCP_PORT must be between 1 and 65535")
         # Original attachments are downloaded out of band, without a file-size cap.
         # Do not impose the old 40 MiB application request cap on local clients.
-        mcp.run(transport=transport, host="127.0.0.1", port=port,
-                max_request_body_size=sys.maxsize)
+        with single_instance(ROOT, port):
+            _register_backend_routes(port)
+            mcp.run(transport=transport, host="127.0.0.1", port=port,
+                    max_request_body_size=sys.maxsize)
     else:
         mcp.run(transport=transport)
