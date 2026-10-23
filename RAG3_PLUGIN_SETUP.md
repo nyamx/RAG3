@@ -10,7 +10,7 @@
 | 이 PC의 ChatGPT 데스크톱 로컬 Chat/Work | 로컬 플러그인 설치 후 로컬 실행 대화에서 사용 | Qdrant, RAG3 `.venv` | 공식 설치 절차 확인; 이 제품 화면의 실제 호출은 별도 검증 필요 |
 | ChatGPT 웹/앱의 클라우드 Chat/Work | RAG3의 로컬 HTTP MCP 서버에 Secure MCP Tunnel로 연결하고 ChatGPT에 사용자 지정 MCP 플러그인 등록 | Qdrant, RAG3 트레이 서버, `tunnel-client` | 공식 절차 확인; 터널·ChatGPT 연결 및 실제 호출은 아직 미검증 |
 
-로컬 플러그인은 `plugins/rag3`에 있고, 마켓플레이스는 `.agents/plugins/marketplace.json`에 있다. RAG3의 MCP 도구는 현재 16개다. `scripts/rag3-mcp-server.py`가 기존 ingestion·검색 코드를 호출한다. 로컬 `stdio` 방식은 트레이 HTTP 서버가 꺼져 있어도 Qdrant와 `.venv`가 준비되면 사용할 수 있다. [OpenAI 플러그인 패키징 문서](https://developers.openai.com/plugins/build/plugins)
+로컬 플러그인은 `plugins/rag3`에 있고, 마켓플레이스는 `.agents/plugins/marketplace.json`에 있다. `scripts/rag3-mcp-server.py`의 MCP 도구 선언은 현재 21개다(위젯 내부용 비공개 도구 1개 포함). `scripts/rag3-mcp-server.py`가 기존 ingestion·검색 코드를 호출한다. 로컬 `stdio` 방식은 트레이 HTTP 서버가 꺼져 있어도 Qdrant와 `.venv`가 준비되면 사용할 수 있다. [OpenAI 플러그인 패키징 문서](https://developers.openai.com/plugins/build/plugins)
 
 ## 1. Codex에 설치하기
 
@@ -25,7 +25,7 @@ codex plugin list --json
 
 마지막 결과에서 `rag3@rag3-local`의 `installed`와 `enabled`가 모두 `true`인지 확인한다. 이후 **새 로컬 Codex 작업**을 열고 `@RAG3`를 선택하거나 “RAG3 컬렉션 목록을 보여줘”처럼 요청한다. 현재 PC에서는 Codex CLI AI가 자연어 요청을 받고 실제 `rag3_list_collections` 도구를 호출하는 것까지 검증했다. 결과 기록은 `artifacts/rag3-plugin-natural-language-after-skill.jsonl`에 있다. [OpenAI 로컬 마켓플레이스 문서](https://developers.openai.com/plugins/build/plugins)
 
-플러그인의 `mcp.json`에는 현재 설치 경로 `C:\python_program\RAG3`가 들어 있다. 프로젝트를 다른 곳으로 옮기면 `plugins/rag3/mcp.json`의 `RAG3_PROJECT_ROOT`를 바꾸고 플러그인을 다시 설치해야 한다. 기존 대화에 도구가 바로 추가되지 않을 수 있으므로 새 작업을 연다. 이 플러그인은 쓰기와 삭제 도구도 켜며, 삭제 도구는 서버에서 지정된 확인 값을 추가로 요구한다.
+플러그인의 `mcp.json`에는 현재 설치 경로 `C:\python_program\RAG3`가 들어 있다. 프로젝트를 다른 곳으로 옮기면 `plugins/rag3/mcp.json`의 `command`, `args`, `RAG3_PROJECT_ROOT` 경로를 바꾸고 플러그인을 다시 설치해야 한다. `pythonw.exe`로 MCP 서버를 직접 시작하므로 플러그인 실행 시 `cmd.exe` 창을 띄우지 않는다. 기존 대화에 도구가 바로 추가되지 않을 수 있으므로 새 작업을 연다. 이 플러그인은 쓰기와 삭제 도구도 켜며, 삭제 도구는 서버에서 지정된 확인 값을 추가로 요구한다.
 
 ### UI를 실행할 때 자동 확인
 
@@ -78,7 +78,7 @@ $env:RAG3_MCP_WRITE_ENABLED = '0'  # 모든 쓰기를 차단할 때만
 
 이미 실행 중인 트레이 서버는 UI를 다시 열어도 환경 변수가 바뀌지 않는다. 서버를 종료하고 다시 시작해야 한다.
 
-**원본 첨부파일 수집:** `rag3_ingest_file`은 ChatGPT 첨부파일 참조(`file`)를 받아 PDF/DOC/DOCX/MD 원본을 PC로 직접 내려받는다. 사용자가 Base64로 변환하거나 PDF를 텍스트로 바꿀 필요가 없다. **RAG3의 25 MiB 파일 상한과 40 MiB 요청 상한은 제거했다.** 다운로드는 작업으로 즉시 접수되며, `rag3_ingestion_status`로 `DOWNLOADING` 상태와 진행 바이트를 확인할 수 있다. 일시정지·재개·취소도 지원한다. MCP 터널에는 파일 본문 대신 작은 참조 정보만 전달하므로 원본 파일에 10 MiB 터널 메시지 한도가 적용되지 않는다. 이전 로컬 클라이언트용 Base64 입력에는 터널 자체의 메시지 제한이 계속 적용된다. [ChatGPT 파일 입력 규격](https://developers.openai.com/plugins/reference), [Secure MCP Tunnel 제한](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+**원본 첨부파일 수집:** `rag3_ingest_file`은 ChatGPT 첨부파일 참조(`file`)를 받아 PDF/DOC/DOCX/MD/TXT/JSON/JSONL/CSV/TSV 원본을 PC로 직접 내려받는다. 사용자가 Base64로 변환하거나 PDF를 텍스트로 바꿀 필요가 없다. **RAG3의 25 MiB 파일 상한과 40 MiB 요청 상한은 제거했다.** 다운로드는 작업으로 즉시 접수되며, `rag3_ingestion_status`로 `DOWNLOADING` 상태와 진행 바이트를 확인할 수 있다. 일시정지·재개·취소도 지원한다. MCP 터널에는 파일 본문 대신 작은 참조 정보만 전달하므로 원본 파일에 10 MiB 터널 메시지 한도가 적용되지 않는다. 이전 로컬 클라이언트용 Base64 입력에는 터널 자체의 메시지 제한이 계속 적용된다. [ChatGPT 파일 입력 규격](https://developers.openai.com/plugins/reference), [Secure MCP Tunnel 제한](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
 서버를 업데이트한 뒤 ChatGPT의 RAG3 연결 화면에서 **Refresh**하여 새 파일 입력 규격을 반영하고 새 대화를 연다. 도구 입력에 `file` 객체와 `openai/fileParams` 메타데이터가 표시되는지 확인한다. 이전 대화에 남아 있는 `content_base64` 필수 입력 정의로는 첨부파일을 전달할 수 없다.
 
@@ -98,3 +98,5 @@ UI 시작 시 구현된 자동화는 **이 PC의 Codex 로컬 플러그인**에 
 | 터널은 연결됐지만 도구 호출 실패 | RAG3 트레이 서버 상태, `data/logs/mcp-server.log`, `data/logs/mcp-tray.log`, `tunnel-client` 상태 |
 
 RAG3 서버의 도구별 입력 및 동작은 [MCP.md](MCP.md)에 정리되어 있다.
+
+`rag3_list_ingestion_jobs` reads shared UI/MCP SQLite job history (collection/status filters, limit/offset), without source paths or signed URLs. Worker concurrency defaults to one; staged Qdrant chunks and SQLite progress support pause and resume, and manager restarts do not auto-resume interrupted jobs.

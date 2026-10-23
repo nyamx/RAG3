@@ -76,7 +76,7 @@ async def main() -> None:
                 assert "Amber forest beta" in doc["chunks"][0]["content"], doc
                 hits = await call("rag3_search_advanced", {
                     "query": "Amber forest beta", "semantic": False,
-                    "bge_lexical": False, "bm25": True,
+                    "bm25": True,
                     "rank_fusion": False, "top_k": 3,
                 })
                 assert hits["results"], hits

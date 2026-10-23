@@ -53,7 +53,7 @@ def main() -> int:
             raise ValueError("collection name is required")
 
         if args.action == "contents":
-            print(json.dumps(collection_contents(name, create_if_missing=True), ensure_ascii=False), flush=True)
+            print(json.dumps(collection_contents(name), ensure_ascii=False), flush=True)
             return 0
 
         result = create_collection(

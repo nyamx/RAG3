@@ -25,7 +25,9 @@ SOURCE_PART_BYTES = 384 * 1024
 PAGE_IMAGE_BYTES = 256 * 1024
 MIME_TYPES = {".pdf": "application/pdf", ".doc": "application/msword",
               ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-              ".md": "text/markdown"}
+              ".md": "text/markdown", ".txt": "text/plain",
+              ".json": "application/json", ".jsonl": "application/x-ndjson",
+              ".csv": "text/csv", ".tsv": "text/tab-separated-values"}
 _PDF_LOCK = threading.Lock()  # PDFium is not thread-safe.
 
 

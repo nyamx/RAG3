@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import subprocess
 from enum import Enum
@@ -12,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import QProcess, Qt, QUrl
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QProcess, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,7 +27,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -44,19 +44,22 @@ from PySide6.QtWidgets import (
     QListWidget,
 )
 
-from rag3.checkpoint import CheckpointStore
 from rag3.source_identity import sha256_file
-from rag3.ui_state import JobState, allowed_actions
+from rag3 import ingestion_jobs as job_db
+from rag3.ingestion_jobs import (change_versions, content_scope, ensure_change_signal,
+                                 list_jobs)
+from rag3.ingestion_manager import client as manager_client
 
 DEFAULT_NATIVE_COLLECTION = "rag3_haystack"
 UI_STATE_PATH = ROOT / "data" / "ui-state.json"
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".html", ".htm", ".md", ".txt",
+    ".json", ".jsonl", ".csv", ".tsv",
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp",
 }
 
-COL_FILE, COL_TYPE, COL_PARSER, COL_STAGE, COL_STATUS = range(5)
+COL_ID, COL_ORIGIN, COL_COLLECTION, COL_FILE, COL_STAGE, COL_STATUS = range(6)
 
 
 class UiState(str, Enum):
@@ -72,8 +75,19 @@ class TextComboBox(QComboBox):
         super().__init__(*args, **kwargs)
         self.setEditable(True)
 
+    def showPopup(self):
+        callback = getattr(self, 'refresh_popup', None)
+        if callback: callback()
+        super().showPopup()
+
     def text(self) -> str:
         return self.currentText()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        callback = getattr(self, 'focus_lost', None)
+        if callback:
+            callback()
 
     def setText(self, value: str) -> None:
         value = str(value)
@@ -98,10 +112,16 @@ class IngestionWindow(QMainWindow):
         self.resize(1280, 820)
 
         self.jobs: list[dict] = []
-        self.current_row: int | None = None
-        self.process: QProcess | None = None
-        self.stdout_buffer = ""
-        self.requested_terminal: JobState | None = None
+        self._last_complete: set[str] = set()
+        self._last_collection_check = 0
+        self._job_view: tuple = ()
+        self._contents_view: tuple | None = None
+        self._displayed_contents_collection: str | None = None
+        self._contents_seen: dict[str, int] = {}
+        self._contents_loading_version = 0
+        self._pending_collection_names: list[str] | None = None
+        self._collections_loading_version = 0
+        self._collection_background = False
 
         self.retrieval_process: QProcess | None = None
         self.retrieval_stdout_buffer = ""
@@ -113,7 +133,6 @@ class IngestionWindow(QMainWindow):
         self.collection_stderr_buffer = ""
         self.collection_action: str | None = None
         self.ui_state = UiState.READY
-        self.collection_busy_message = ""
 
         toolbar = QToolBar("Documents")
         self.addToolBar(toolbar)
@@ -139,14 +158,9 @@ class IngestionWindow(QMainWindow):
         self.collection.setToolTip("Collection used by both ingestion and retrieval.")
         collection_bar.addWidget(self.collection)
 
-        self.refresh_collections_btn = QPushButton("Refresh")
-        self.refresh_collections_btn.setToolTip("Reload collection names from the running Qdrant server.")
-        self.refresh_collections_btn.clicked.connect(self.refresh_collections)
-        collection_bar.addWidget(self.refresh_collections_btn)
-
         self.create_collection_btn = QPushButton("Create")
         self.create_collection_btn.setToolTip(
-            "Create the typed collection with the same 1024D dense + sparse schema used by RAG3."
+            "Create the typed collection with 1024D dense and BM25 indexes used by RAG3."
         )
         self.create_collection_btn.clicked.connect(self.create_collection)
         collection_bar.addWidget(self.create_collection_btn)
@@ -157,17 +171,6 @@ class IngestionWindow(QMainWindow):
         )
         self.manage_collections_btn.clicked.connect(self.manage_collections)
         collection_bar.addWidget(self.manage_collections_btn)
-
-        self.collection_busy_label = QLabel("")
-        self.collection_busy_label.setVisible(False)
-        collection_bar.addWidget(self.collection_busy_label)
-
-        self.collection_progress = QProgressBar()
-        self.collection_progress.setRange(0, 0)
-        self.collection_progress.setFixedWidth(120)
-        self.collection_progress.setTextVisible(False)
-        self.collection_progress.setVisible(False)
-        collection_bar.addWidget(self.collection_progress)
 
         collection_bar.addStretch(1)
         root.addLayout(collection_bar)
@@ -184,14 +187,14 @@ class IngestionWindow(QMainWindow):
         button_specs = (
             ("run", "Run", self.run_selected, "Run the selected queued document."),
             ("run_all", "Run All", self.run_all, "Run all queued documents sequentially."),
-            ("pause", "Pause", self.pause_current, "Request a safe pause after the current pipeline component; save checkpoint."),
-            ("resume", "Resume", self.resume_selected, "Resume the selected document from its saved checkpoint."),
-            ("cancel", "Cancel", self.cancel_current, "Stop the active worker; the last valid checkpoint is preserved."),
-            ("retry", "Retry", self.retry_selected, "Retry a failed/cancelled job; resume if a checkpoint exists."),
-            ("restart", "Restart", self.restart_selected, "Discard processing state/checkpoint and process the source again from the beginning."),
+            ("pause", "Pause", self.pause_current, "Pause at the next safe step; completed chunks remain in Qdrant."),
+            ("resume", "Resume", self.resume_selected, "Resume from the Qdrant ingestion progress."),
+            ("cancel", "Cancel", self.cancel_current, "Stop the active worker; staged Qdrant chunks remain available for retry."),
+            ("retry", "Retry", self.retry_selected, "Retry a failed/cancelled job using staged chunks when available."),
+            ("restart", "Restart", self.restart_selected, "Discard staged processing progress and start the source again."),
             ("delete", "Delete", self.remove_selected, "Remove selected rows from this UI queue only; source/Qdrant data are not deleted."),
             ("open_source", "Open Source", self.open_source, "Open the original source file."),
-            ("open_artifacts", "Open Artifact Folder", self.open_artifacts, "Open this source's checkpoint/artifact folder."),
+            ("open_artifacts", "Open Source Folder", self.open_artifacts, "Open this source's managed original folder."),
         )
         for key, label, handler, tip in button_specs:
             btn = QPushButton(label)
@@ -205,11 +208,11 @@ class IngestionWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         ingest_root.addWidget(splitter, 1)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["File", "Type", "Parser", "Current stage", "Status"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Job ID", "Origin", "Collection", "File", "Current stage", "Status"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_FILE, QHeaderView.ResizeMode.Stretch)
-        for c in range(1, 5):
+        for c in (COL_ID, COL_ORIGIN, COL_COLLECTION, COL_STAGE, COL_STATUS):
             header.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self.selection_changed)
         splitter.addWidget(self.table)
@@ -225,10 +228,6 @@ class IngestionWindow(QMainWindow):
         self.tabs.addTab(self.inspector, "Inspector")
         self.tabs.addTab(self.errors, "Detailed Error")
         splitter.addWidget(self.tabs)
-
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        ingest_root.addWidget(self.progress)
 
         self.retrieval_tab = QWidget()
         self.main_tabs.addTab(self.retrieval_tab, "Retrieval")
@@ -251,12 +250,10 @@ class IngestionWindow(QMainWindow):
         query_row.addWidget(self.retrieval_top_k)
 
         self.retrieval_semantic = QCheckBox("BGE-M3 (Semantic)")
-        self.retrieval_bge_lexical = QCheckBox("BGE-M3 (Lexical)")
         self.retrieval_bm25 = QCheckBox("BM25 (Lexical)")
         self.retrieval_rank_fusion = QCheckBox("Rank Fusion (RRF)")
         for checkbox in (
             self.retrieval_semantic,
-            self.retrieval_bge_lexical,
             self.retrieval_bm25,
             self.retrieval_rank_fusion,
         ):
@@ -283,19 +280,7 @@ class IngestionWindow(QMainWindow):
         self.main_tabs.addTab(self.contents_tab, "Collection Contents")
         contents_root = QVBoxLayout(self.contents_tab)
 
-        contents_actions = QHBoxLayout()
-        self.refresh_contents_btn = QPushButton("Refresh Contents")
-        self.refresh_contents_btn.setToolTip(
-            "Load a document-level summary for the selected Qdrant collection."
-        )
-        self.refresh_contents_btn.clicked.connect(self.refresh_contents)
-        contents_actions.addWidget(self.refresh_contents_btn)
-        contents_actions.addStretch(1)
-        contents_root.addLayout(contents_actions)
-
-        self.contents_status = QLabel(
-            "Press Refresh Contents to load the selected collection."
-        )
+        self.contents_status = QLabel("Collection contents load automatically when this tab opens.")
         contents_root.addWidget(self.contents_status)
 
         self.contents_table = QTableWidget(0, 5)
@@ -315,401 +300,329 @@ class IngestionWindow(QMainWindow):
         # Changing collections invalidates rows from the previous selection.
         self.collection.currentTextChanged.connect(self.collection_changed)
 
+        signal_path = ensure_change_signal()
+        self.change_watcher = QFileSystemWatcher(self)
+        self.change_watcher.addPath(str(signal_path.parent))
+        self._watch_change_files()
+        self.change_watcher.fileChanged.connect(self._change_signal)
+        self.change_watcher.directoryChanged.connect(self._change_directory)
+        self.change_debounce = QTimer(self)
+        self.change_debounce.setSingleShot(True)
+        self.change_debounce.setInterval(150)
+        self.change_debounce.timeout.connect(self._check_revisions)
+        initial = change_versions('jobs', 'collections')
+        self._jobs_seen_version = initial['jobs']
+        self._collections_seen_version = initial['collections']
+        self.collection.focus_lost = self._collection_focus_lost
         self.load_ui_state()
+        self.load_jobs()
         self.statusBar().showMessage("Ready")
         self.update_controls()
         self.refresh_collections()
+        self.collection.refresh_popup = self._check_revisions
+        self.main_tabs.currentChanged.connect(self.tab_changed)
+        QTimer.singleShot(0, self._check_revisions)
+
+    def _change_signal(self, path: str) -> None:
+        self._watch_change_files()
+        self.change_debounce.start()
+
+    def _change_directory(self, _path: str) -> None:
+        if self._watch_change_files():
+            self.change_debounce.start()
+
+    def _watch_change_files(self) -> bool:
+        """Watch both the RAG3 signal and SQLite writes from older processes."""
+        paths = (ensure_change_signal(), job_db.DB_PATH,
+                 Path(str(job_db.DB_PATH) + '-wal'))
+        watched = set(self.change_watcher.files())
+        added = False
+        for path in paths:
+            value = str(path)
+            if path.exists() and value not in watched:
+                self.change_watcher.addPath(value)
+                added = True
+        return added
+
+    def _collection_focus_lost(self) -> None:
+        if self._pending_collection_names is not None:
+            names = self._pending_collection_names
+            self._pending_collection_names = None
+            self._apply_collection_names(names, background=False)
+        self._check_revisions()
+
+    def _collection_is_editing(self) -> bool:
+        editor = self.collection.lineEdit()
+        return (self.collection.hasFocus() or (editor is not None and editor.hasFocus())
+                or self.collection.view().isVisible())
+
+    def _check_revisions(self) -> None:
+        collection = self.current_collection()
+        scopes = ['jobs', 'collections']
+        if collection:
+            scopes.append(content_scope(collection))
+        try:
+            versions = change_versions(*scopes)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Change notification unavailable: {exc}")
+            return
+        if versions['jobs'] != self._jobs_seen_version and self.load_jobs():
+            self._jobs_seen_version = versions['jobs']
+        if (versions['collections'] != self._collections_seen_version
+                and self.ui_state == UiState.READY and not self._collection_is_editing()):
+            self.refresh_collections(background=True)
+        if (collection and self.collection.findText(collection) >= 0
+                and self.ui_state == UiState.READY
+                and self.main_tabs.currentWidget() is self.contents_tab
+                and (self._displayed_contents_collection != collection
+                     or versions[content_scope(collection)] != self._contents_seen.get(collection))):
+            self.refresh_contents(background=True)
+
+    def event(self, event):
+        result = super().event(event)
+        if event.type() == QEvent.Type.WindowActivate and hasattr(self, 'change_debounce'):
+            self.change_debounce.start()
+        return result
 
     def current_collection(self) -> str:
-        return self.collection.text().strip() or DEFAULT_NATIVE_COLLECTION
+        return self.collection.text().strip()
 
     def selected_row(self) -> int | None:
         rows = sorted({x.row() for x in self.table.selectedIndexes()})
         return rows[0] if rows else None
 
-    def state_for_row(self, row: int) -> JobState:
-        return JobState(self.jobs[row]["state"])
+    def _manager_action(self, operation: str, job_id: str) -> bool:
+        try:
+            manager_client('action', operation=operation, job_id=job_id)
+            self.load_jobs()
+            return True
+        except Exception as exc:
+            self.errors.appendPlainText(f"Manager {operation} failed: {exc}")
+            self.statusBar().showMessage(f"Ingestion manager error: {exc}")
+            return False
 
-    def set_job_state(self, row: int, state: JobState, stage: str | None = None) -> None:
-        self.jobs[row]["state"] = state.value
-        if stage is not None:
-            self.jobs[row]["stage"] = stage
-            self.table.item(row, COL_STAGE).setText(stage)
-        item = self.table.item(row, COL_STATUS)
-        item.setText(state.value)
-        color = {
-            JobState.RUNNING: "#fff2b2",
-            JobState.RESUMING: "#fff2b2",
-            JobState.PAUSING: "#fff2b2",
-            JobState.COMPLETE: "#d7f5dd",
-            JobState.FAILED: "#ffd6d6",
-            JobState.CANCELLED: "#e5e5e5",
-            JobState.PAUSED: "#e3e8ff",
-        }.get(state)
-        if color:
-            item.setBackground(QColor(color))
+    def save_jobs(self) -> None:
+        """Ingestion jobs belong exclusively to the shared SQLite DB."""
+        return
+
+    def load_jobs(self) -> bool:
+        """Load shared jobs only after a revision change or an explicit action."""
+        try:
+            data = []
+            offset = 0
+            while True:
+                page = list_jobs(limit=200,offset=offset,include_hidden=False)
+                data.extend(page['jobs'])
+                offset += len(page['jobs'])
+                if offset >= page['total'] or not page['jobs']:
+                    break
+        except Exception as exc:
+            message = f"Ingestion DB unavailable: {exc}"
+            if self.statusBar().currentMessage() != message:
+                self.statusBar().showMessage(message)
+            return False
+        view = tuple((j['job_id'], j['origin'], j['collection'], j['filename'],
+                      j['stage'], j['status'], j.get('source_sha256')) for j in data)
+        if view == self._job_view:
+            return True
+        selected = self.selected_row()
+        selected_id = self.jobs[selected]['job_id'] if selected is not None and selected < len(self.jobs) else None
+        scrollbar = self.table.verticalScrollBar().value()
+        self.jobs = [{**j, 'state':j['status'], 'path':j.get('source') or ''} for j in data]
+        completed = {j['job_id'] for j in data if j['status']=='COMPLETE'}
+        newly_completed = completed - self._last_complete
+        current_ids = [self.table.item(i, COL_ID).text() for i in range(self.table.rowCount())]
+        target_ids = [j['job_id'] for j in data]
+        structural_change = current_ids != target_ids
+        # SQLite list outputs intentionally omit private source paths. UI can query locally for Open Source.
+        self.table.blockSignals(True)
+        try:
+            for i in range(len(current_ids) - 1, -1, -1):
+                if current_ids[i] not in target_ids:
+                    self.table.removeRow(i)
+                    current_ids.pop(i)
+            for i, job in enumerate(data):
+                if i >= len(current_ids) or current_ids[i] != job['job_id']:
+                    self.table.insertRow(i)
+                    current_ids.insert(i, job['job_id'])
+                values=(job['job_id'],job['origin'],job['collection'],job['filename'],
+                        job['stage'],job['status'])
+                for c,value in enumerate(values):
+                    value = str(value or '')
+                    item = self.table.item(i, c)
+                    if item is None:
+                        self.table.setItem(i,c,QTableWidgetItem(value))
+                    elif item.text() != value:
+                        item.setText(value)
+                file_item = self.table.item(i,COL_FILE)
+                tooltip = 'Job: '+job['job_id']
+                if file_item.toolTip() != tooltip:
+                    file_item.setToolTip(tooltip)
+            while len(current_ids) > len(target_ids):
+                self.table.removeRow(len(current_ids) - 1)
+                current_ids.pop()
+            if structural_change and selected_id:
+                match=next((i for i,j in enumerate(data) if j['job_id']==selected_id),None)
+                if match is not None: self.table.selectRow(match)
+            if structural_change:
+                self.table.verticalScrollBar().setValue(scrollbar)
+        finally:
+            self.table.blockSignals(False)
+        self._last_complete = completed
+        self._job_view = view
         self.update_controls()
+        if newly_completed and self.main_tabs.currentWidget() is self.contents_tab:
+            if any(j['job_id'] in newly_completed and j['collection'] == self.current_collection() for j in data):
+                self.refresh_contents(background=True)
+        return True
 
-    def set_ui_state(self, state: UiState, message: str = "") -> None:
+    def set_ui_state(self, state: UiState) -> None:
         """Set the global UI operation state and re-apply the control policy."""
+        if self.ui_state == state:
+            return
         self.ui_state = state
-        self.collection_busy_message = message if state == UiState.COLLECTION_BUSY else ""
         self.update_controls()
+        if state == UiState.READY and hasattr(self, 'change_debounce'):
+            QTimer.singleShot(0, self._check_revisions)
+
+    @staticmethod
+    def _set_enabled(widget, enabled: bool) -> None:
+        if widget.isEnabled() != enabled:
+            widget.setEnabled(enabled)
 
     def update_controls(self) -> None:
-        """Apply all main-window enable/disable rules from one place."""
-        state = self.ui_state
-        row = self.selected_row()
-        selected_allowed = (
-            allowed_actions(self.state_for_row(row))
-            if row is not None
-            else frozenset()
-        )
-        runnable_count = sum(
-            1
-            for job in self.jobs
-            if JobState(job["state"]) in {JobState.QUEUED, JobState.IDLE}
-        )
-
-        collection_ready = state == UiState.READY
-        self.collection.setEnabled(collection_ready)
-        self.refresh_collections_btn.setEnabled(collection_ready)
-        self.create_collection_btn.setEnabled(collection_ready)
-        self.manage_collections_btn.setEnabled(collection_ready)
-
-        collection_busy = state == UiState.COLLECTION_BUSY
-        self.collection_busy_label.setText(self.collection_busy_message)
-        self.collection_busy_label.setVisible(collection_busy)
-        self.collection_progress.setVisible(collection_busy)
-
+        state=self.ui_state
+        row=self.selected_row()
+        job=self.jobs[row] if row is not None and row < len(self.jobs) else None
+        status=job['status'] if job else ''
+        collection_ready=state==UiState.READY
+        ingestion_ready=state in {UiState.READY, UiState.RETRIEVAL_RUNNING}
+        self._set_enabled(self.collection, collection_ready)
+        self._set_enabled(self.create_collection_btn, collection_ready)
+        self._set_enabled(self.manage_collections_btn, collection_ready)
         for action in self.document_actions.values():
-            action.setEnabled(state == UiState.READY)
-
-        retrieval_ready = state == UiState.READY
-        selected_retrievers = sum(
-            checkbox.isChecked()
-            for checkbox in (
-                self.retrieval_semantic,
-                self.retrieval_bge_lexical,
-                self.retrieval_bm25,
-            )
-        )
-        self.query.setEnabled(retrieval_ready)
-        self.retrieval_top_k.setEnabled(retrieval_ready)
-        self.retrieval_semantic.setEnabled(retrieval_ready)
-        self.retrieval_bge_lexical.setEnabled(retrieval_ready)
-        self.retrieval_bm25.setEnabled(retrieval_ready)
-        self.retrieval_rank_fusion.setEnabled(
-            retrieval_ready and selected_retrievers >= 2
-        )
-        self.search_btn.setEnabled(
-            retrieval_ready
-            and selected_retrievers >= 1
-            and bool(self.current_collection())
-        )
-        self.refresh_contents_btn.setEnabled(retrieval_ready)
-
-        for button in self.buttons.values():
-            button.setEnabled(False)
-
-        if state == UiState.READY:
-            for key, button in self.buttons.items():
-                if key == "run_all":
-                    button.setEnabled(runnable_count > 0)
-                else:
-                    button.setEnabled(key in selected_allowed)
-
-        elif state == UiState.INGEST_RUNNING:
-            active_state = (
-                self.state_for_row(self.current_row)
-                if self.current_row is not None
-                else None
-            )
-            self.buttons["pause"].setEnabled(
-                active_state in {JobState.RUNNING, JobState.RESUMING}
-            )
-            self.buttons["cancel"].setEnabled(self.current_row is not None)
-            if row is not None:
-                self.buttons["open_source"].setEnabled("open_source" in selected_allowed)
-                self.buttons["open_artifacts"].setEnabled("open_artifacts" in selected_allowed)
-
-        elif state == UiState.INGEST_PAUSED and row is not None:
-            for key in ("resume", "restart", "delete", "open_source", "open_artifacts"):
-                self.buttons[key].setEnabled(key in selected_allowed)
+            self._set_enabled(action, ingestion_ready and bool(self.current_collection()))
+        retrieval_ready=state==UiState.READY
+        selected_retrievers=sum(cb.isChecked() for cb in
+                (self.retrieval_semantic,self.retrieval_bm25))
+        for ctrl in (self.query,self.retrieval_top_k,self.retrieval_semantic,
+                     self.retrieval_bm25):
+            self._set_enabled(ctrl, retrieval_ready)
+        self._set_enabled(self.retrieval_rank_fusion, retrieval_ready and selected_retrievers>=2)
+        self._set_enabled(self.search_btn, retrieval_ready and selected_retrievers>=1 and bool(self.current_collection()))
+        flags = {key: False for key in self.buttons}
+        if ingestion_ready:
+            flags['run_all'] = any(j['status']=='QUEUED' for j in self.jobs)
+            if job:
+                flags.update({
+                    'run':status=='QUEUED',
+                    'pause':status in {'QUEUED','DOWNLOADING','RUNNING','RESUMING'},
+                    'resume':status=='PAUSED',
+                    'cancel':status in {'QUEUED','DOWNLOADING','RUNNING','RESUMING','PAUSING','PAUSED'},
+                    'retry':status in {'FAILED','CANCELLED'},
+                    'restart':status in {'FAILED','CANCELLED','PAUSED','COMPLETE'},
+                    'delete':status in {'QUEUED','PAUSED','FAILED','CANCELLED','COMPLETE'},
+                    'open_source':True,
+                    'open_artifacts':bool(job.get('source_sha256')),
+                })
+        for key, allow in flags.items():
+            self._set_enabled(self.buttons[key], allow)
 
     def add_path(self, path: str) -> None:
-        p = Path(path).expanduser().resolve()
-        if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        p=Path(path).expanduser().resolve()
+        if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTENSIONS:return
+        if not self.current_collection():
+            QMessageBox.warning(self,'Create collection','Create and select a Qdrant collection before ingestion.')
             return
-        if any(Path(j["path"]).resolve() == p for j in self.jobs):
-            return
-
-        source_sha = sha256_file(p)
-        checkpoints = CheckpointStore(source_sha)
-        manifest = checkpoints.load_manifest()
-        mode = "run"
-        state = JobState.QUEUED
-
-        if checkpoints.has_checkpoint() and manifest and manifest.get("state") != "COMPLETE":
-            box = QMessageBox(self)
-            box.setWindowTitle("Interrupted ingestion found")
-            box.setText("Interrupted ingestion found.")
-            resume_btn = box.addButton("Resume from checkpoint", QMessageBox.ButtonRole.AcceptRole)
-            restart_btn = box.addButton("Restart from beginning", QMessageBox.ButtonRole.DestructiveRole)
-            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is resume_btn:
-                mode = "resume"
-                state = JobState.PAUSED
-            elif box.clickedButton() is restart_btn:
-                mode = "restart"
-                state = JobState.QUEUED
-            else:
-                return
-        elif manifest and manifest.get("state") == "COMPLETE":
-            box = QMessageBox(self)
-            box.setWindowTitle("Already indexed")
-            box.setText("This source SHA is already COMPLETE.")
-            skip_btn = box.addButton("Skip", QMessageBox.ButtonRole.AcceptRole)
-            reindex_btn = box.addButton("Re-index", QMessageBox.ButtonRole.DestructiveRole)
-            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is skip_btn:
-                state = JobState.COMPLETE
-                mode = "run"
-            elif box.clickedButton() is reindex_btn:
-                state = JobState.QUEUED
-                mode = "restart"
-            else:
-                return
-
-        source_type, parser = display_detection(p)
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        self.jobs.append({
-            "path": str(p),
-            "source_sha256": source_sha,
-            "state": state.value,
-            "stage": "Ready",
-            "mode": mode,
-            "result": None,
-        })
-        values = [p.name, source_type, parser, "Ready", state.value]
-        for col, value in enumerate(values):
-            self.table.setItem(row, col, QTableWidgetItem(value))
-        self.table.item(row, COL_FILE).setToolTip(str(p))
-        self.table.selectRow(row)
-        self.update_controls()
+        try:
+            manager_client('submit',origin='UI',collection=self.current_collection(),path=str(p),requested=False)
+            self.load_jobs()
+        except Exception as exc:
+            self.errors.appendPlainText(f'Cannot queue {p.name}: {exc}')
+            self.statusBar().showMessage(f'Ingestion manager error: {exc}')
 
     def add_files(self) -> None:
-        pattern = " ".join(f"*{x}" for x in sorted(SUPPORTED_EXTENSIONS))
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add RAG3 documents", "", f"Supported documents ({pattern});;All files (*)"
-        )
-        for p in paths:
-            self.add_path(p)
+        pattern=' '.join(f'*{x}' for x in sorted(SUPPORTED_EXTENSIONS))
+        paths,_=QFileDialog.getOpenFileNames(self,'Add RAG3 documents','',
+                                            f'Supported documents ({pattern});;All files (*)')
+        for path in paths:self.add_path(path)
 
     def add_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Add documents from folder")
+        folder=QFileDialog.getExistingDirectory(self,'Add documents from folder')
         if folder:
-            for p in sorted(Path(folder).iterdir()):
-                if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    self.add_path(str(p))
+            for path in sorted(Path(folder).iterdir()):
+                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    self.add_path(str(path))
 
     def selection_changed(self) -> None:
-        row = self.selected_row()
-        if row is not None:
-            self.inspector.setPlainText(json.dumps(self.jobs[row], ensure_ascii=False, indent=2))
+        row=self.selected_row()
+        if row is not None and row<len(self.jobs):
+            self.inspector.setPlainText(json.dumps(self.jobs[row],ensure_ascii=False,indent=2))
         self.update_controls()
 
     def run_selected(self) -> None:
-        row = self.selected_row()
-        if row is not None:
-            self.start_row(row, self.jobs[row].get("mode", "run"))
+        row=self.selected_row()
+        if row is not None:self.start_row(row,'run')
 
     def run_all(self) -> None:
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
-            return
-        for i, job in enumerate(self.jobs):
-            if JobState(job["state"]) in {JobState.QUEUED, JobState.IDLE}:
-                self.start_row(i, job.get("mode", "run"))
-                return
-        self.statusBar().showMessage("No queued documents.")
+        for job in list(self.jobs):
+            if job['status']=='QUEUED':
+                self._manager_action('run',job['job_id'])
 
     def start_row(self, row: int, mode: str) -> None:
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
-            return
-        self.current_row = row
-        self.requested_terminal = None
-        self.jobs[row]["mode"] = mode
-        self.set_ui_state(UiState.INGEST_RUNNING)
-        state = JobState.RESUMING if mode == "resume" else JobState.RUNNING
-        self.set_job_state(row, state, "Starting")
-        self.progress.setValue(5)
-        self.log.appendPlainText(f"=== {Path(self.jobs[row]['path']).name} [{mode}] ===")
-
-        self.process = QProcess(self)
-        self.process.setProgram(str(ROOT / ".venv" / "Scripts" / "python.exe"))
-        self.process.setArguments([
-            str(ROOT / "scripts" / "ingest-worker.py"),
-            self.jobs[row]["path"],
-            "--collection", self.current_collection(),
-            "--mode", mode,
-        ])
-        self.process.setWorkingDirectory(str(ROOT))
-        self.process.readyReadStandardOutput.connect(self.read_stdout)
-        self.process.readyReadStandardError.connect(self.read_stderr)
-        self.process.finished.connect(self.finished)
-        self.process.start()
-        self.update_controls()
-
-    def read_stdout(self) -> None:
-        if not self.process:
-            return
-        text = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        self.stdout_buffer += text
-        while "\n" in self.stdout_buffer:
-            line, self.stdout_buffer = self.stdout_buffer.split("\n", 1)
-            if line.strip():
-                self.handle_line(line.strip())
-
-    def read_stderr(self) -> None:
-        if not self.process:
-            return
-        text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace").strip()
-        if text:
-            self.errors.appendPlainText(text[-8000:])
-
-    def handle_line(self, line: str) -> None:
-        try:
-            event = json.loads(line)
-        except Exception:
-            self.log.appendPlainText(line)
-            return
-
-        etype = event.get("type")
-        if etype == "log":
-            msg = str(event.get("message", ""))
-            self.log.appendPlainText(msg)
-            if self.current_row is not None and msg.startswith("STAGE "):
-                parts = msg.split()
-                if len(parts) >= 3:
-                    self.jobs[self.current_row]["stage"] = " ".join(parts[1:])
-                    self.table.item(self.current_row, COL_STAGE).setText(" ".join(parts[1:]))
-        elif etype == "paused" and self.current_row is not None:
-            self.set_job_state(self.current_row, JobState.PAUSED, "Paused at checkpoint")
-        elif etype == "result" and self.current_row is not None:
-            result = event.get("result") or {}
-            self.jobs[self.current_row]["result"] = result
-            self.inspector.setPlainText(json.dumps(result, ensure_ascii=False, indent=2))
-        elif etype == "error":
-            self.errors.appendPlainText(event.get("message", "Worker error"))
-            if event.get("traceback"):
-                self.errors.appendPlainText(event["traceback"])
-
-    def finished(self, exit_code: int, _exit_status) -> None:
-        row = self.current_row
-        if row is None:
-            self.process = None
-            self.set_ui_state(UiState.READY)
-            return
-
-        if self.stdout_buffer.strip():
-            self.handle_line(self.stdout_buffer.strip())
-        self.stdout_buffer = ""
-
-        if self.requested_terminal == JobState.CANCELLED:
-            final_state = JobState.CANCELLED
-            self.set_job_state(row, final_state, "Cancelled; checkpoint preserved")
-        elif exit_code == 75:
-            final_state = JobState.PAUSED
-            self.set_job_state(row, final_state, "Paused at checkpoint")
-        elif exit_code == 0:
-            final_state = JobState.COMPLETE
-            self.set_job_state(row, final_state, "Complete")
-            self.progress.setValue(100)
-        else:
-            final_state = JobState.FAILED
-            self.set_job_state(row, final_state, "Failed")
-
-        self.process = None
-        self.current_row = None
-        self.requested_terminal = None
-
-        for i, job in enumerate(self.jobs):
-            if JobState(job["state"]) == JobState.QUEUED:
-                self.start_row(i, job.get("mode", "run"))
-                return
-
-        if final_state == JobState.PAUSED:
-            self.set_ui_state(UiState.INGEST_PAUSED)
-        else:
-            self.set_ui_state(UiState.READY)
-        self.statusBar().showMessage("Queue finished.")
+        job=self.jobs[row]
+        op={'run':'run','resume':'resume','restart':'restart'}.get(mode,mode)
+        self._manager_action(op,job['job_id'])
 
     def pause_current(self) -> None:
-        if self.current_row is None:
-            return
-        row = self.current_row
-        sha = self.jobs[row]["source_sha256"]
-        p = ROOT / "data" / "checkpoints" / sha / "pause.request"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("pause\n", encoding="utf-8")
-        self.set_job_state(row, JobState.PAUSING, "Pause requested")
+        row=self.selected_row()
+        if row is not None:self._manager_action('pause',self.jobs[row]['job_id'])
 
     def resume_selected(self) -> None:
-        row = self.selected_row()
-        if row is not None:
-            self.start_row(row, "resume")
+        row=self.selected_row()
+        if row is not None:self._manager_action('resume',self.jobs[row]['job_id'])
 
     def retry_selected(self) -> None:
-        row = self.selected_row()
-        if row is None:
-            return
-        sha = self.jobs[row]["source_sha256"]
-        mode = "resume" if CheckpointStore(sha).has_checkpoint() else "run"
-        self.start_row(row, mode)
+        row=self.selected_row()
+        if row is not None:self._manager_action('retry',self.jobs[row]['job_id'])
 
     def restart_selected(self) -> None:
-        row = self.selected_row()
-        if row is not None:
-            self.set_job_state(row, JobState.RESETTING, "Resetting")
-            self.start_row(row, "restart")
+        row=self.selected_row()
+        if row is not None:self._manager_action('restart',self.jobs[row]['job_id'])
 
     def cancel_current(self) -> None:
-        if not self.process or self.current_row is None:
-            return
-        self.requested_terminal = JobState.CANCELLED
-        self.set_job_state(self.current_row, JobState.CANCELLING, "Cancelling")
-        self.process.kill()
+        row=self.selected_row()
+        if row is not None:self._manager_action('cancel',self.jobs[row]['job_id'])
 
     def remove_selected(self) -> None:
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
-            return
-        rows = sorted({item.row() for item in self.table.selectedIndexes()}, reverse=True)
-        for row in rows:
-            self.table.removeRow(row)
-            self.jobs.pop(row)
+        row=self.selected_row()
+        if row is not None:self._manager_action('hide',self.jobs[row]['job_id'])
 
-        if self.ui_state == UiState.INGEST_PAUSED and not any(
-            JobState(job["state"]) == JobState.PAUSED for job in self.jobs
-        ):
-            self.set_ui_state(UiState.READY)
-        else:
-            self.update_controls()
+    def _local_source(self, job_id: str) -> str:
+        from rag3.ingestion_jobs import one
+        return one(job_id,private=True).get('source') or ''
 
     def open_source(self) -> None:
-        row = self.selected_row()
+        row=self.selected_row()
         if row is not None:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.jobs[row]["path"]))
+            path=self._local_source(self.jobs[row]['job_id'])
+            if path: QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def open_artifacts(self) -> None:
-        row = self.selected_row()
-        if row is None:
-            return
-        folder = ROOT / "data" / "checkpoints" / self.jobs[row]["source_sha256"]
-        folder.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        row=self.selected_row()
+        if row is not None and self.jobs[row].get('source_sha256'):
+            folder=ROOT/'data'/'sources'/self.jobs[row]['source_sha256']
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def periodic_collections(self) -> None:
+        self._check_revisions()
+
+    def periodic_contents(self) -> None:
+        self._check_revisions()
+
+    def tab_changed(self, _index: int) -> None:
+        if self.main_tabs.currentWidget() is self.contents_tab and self.current_collection():
+            QTimer.singleShot(0, self._check_revisions)
 
     def _start_collection_worker(
         self,
@@ -717,14 +630,16 @@ class IngestionWindow(QMainWindow):
         collection: str | None = None,
         collections: list[str] | None = None,
         bm25_settings: tuple[float, float, float] | None = None,
+        background: bool = False,
     ) -> bool:
         if (
             self.collection_process
             and self.collection_process.state() != QProcess.ProcessState.NotRunning
         ):
-            self.statusBar().showMessage(
-                "A collection operation is already running. Please wait."
-            )
+            if not background:
+                self.statusBar().showMessage(
+                    "A collection operation is already running. Please wait."
+                )
             return False
 
         busy_message = {
@@ -735,10 +650,12 @@ class IngestionWindow(QMainWindow):
         }.get(action, "Working with collections…")
 
         self.collection_action = action
+        self._collection_background = background
         self.collection_stdout_buffer = ""
         self.collection_stderr_buffer = ""
-        self.set_ui_state(UiState.COLLECTION_BUSY, busy_message)
-        self.statusBar().showMessage(busy_message)
+        if not background:
+            self.set_ui_state(UiState.COLLECTION_BUSY)
+            self.statusBar().showMessage(busy_message)
 
         self.collection_process = QProcess(self)
         self.collection_process.setProgram(str(ROOT / ".venv" / "Scripts" / "python.exe"))
@@ -762,8 +679,12 @@ class IngestionWindow(QMainWindow):
         self.collection_process.start()
         return True
 
-    def refresh_collections(self) -> None:
-        self._start_collection_worker("list")
+    def refresh_collections(self, *, background: bool = False) -> bool:
+        version = change_versions('collections')['collections']
+        started = self._start_collection_worker("list", background=background)
+        if started:
+            self._collections_loading_version = version
+        return started
 
     def create_collection(self) -> None:
         dialog = QDialog(self)
@@ -897,24 +818,30 @@ class IngestionWindow(QMainWindow):
     def collection_changed(self, _text: str) -> None:
         """Clear stale rows whenever the shared collection selector changes."""
         self.contents_table.setRowCount(0)
-        self.contents_status.setText(
-            f"Collection selected: {self.current_collection()} — press Refresh Contents."
-        )
+        self._contents_view = None
+        self._displayed_contents_collection = None
+        self.contents_status.setText(f"Collection selected: {self.current_collection()}")
+        self.update_controls()
+        if self.main_tabs.currentWidget() is self.contents_tab and self.current_collection():
+            QTimer.singleShot(0, self._check_revisions)
 
-    def refresh_contents(self) -> None:
+    def refresh_contents(self, *, background: bool = False) -> bool:
         """Request a fresh document-level view from the collection worker."""
         if self.ui_state != UiState.READY:
-            self.contents_status.setText("Another operation is still running.")
-            return
-        self.contents_table.setRowCount(0)
-        self.contents_status.setText(f"Loading {self.current_collection()}...")
-        self._start_collection_worker("contents", self.current_collection())
+            return False
+        collection = self.current_collection()
+        if not collection:
+            return False
+        version = change_versions(content_scope(collection))[content_scope(collection)]
+        started = self._start_collection_worker("contents", collection, background=background)
+        if started:
+            self._contents_loading_version = version
+        return started
 
     def _render_collection_contents(self, payload: dict) -> None:
-        """Render worker output without reimplementing storage/grouping logic."""
+        """Apply only changed cells from the document-level worker output."""
         documents = payload.get("documents") or []
-        self.contents_table.setRowCount(len(documents))
-
+        rows = []
         for row, document in enumerate(documents):
             page_start = document.get("page_start")
             page_end = document.get("page_end")
@@ -934,16 +861,53 @@ class IngestionWindow(QMainWindow):
                 document.get("source_uri") or "—",
                 document.get("document_id") or "—",
             )
-            for column, value in enumerate(values):
-                self.contents_table.setItem(
-                    row, column, QTableWidgetItem(str(value))
-                )
-
-        self.contents_status.setText(
+            rows.append(tuple(str(value) for value in values))
+        status = (
             f"{payload.get('document_count', len(documents))} document(s), "
             f"{payload.get('chunk_count', 0)} chunk(s) | "
             f"collection={payload.get('collection') or self.current_collection()}"
         )
+        view = (tuple(rows), status)
+        if view == self._contents_view:
+            return
+        if self.contents_table.rowCount() != len(rows):
+            self.contents_table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                item = self.contents_table.item(row, column)
+                if item is None:
+                    self.contents_table.setItem(row, column, QTableWidgetItem(value))
+                elif item.text() != value:
+                    item.setText(value)
+        if self.contents_status.text() != status:
+            self.contents_status.setText(status)
+        self._contents_view = view
+
+    def _apply_collection_names(self, names: list[str], *, background: bool) -> bool:
+        current_names = [self.collection.itemText(i) for i in range(self.collection.count())]
+        if names == current_names or (background and self.collection.hasFocus()):
+            return False
+        current = self.current_collection()
+        self.collection.blockSignals(True)
+        try:
+            for i in range(self.collection.count() - 1, -1, -1):
+                if self.collection.itemText(i) not in names:
+                    self.collection.removeItem(i)
+            for i, name in enumerate(names):
+                if i < self.collection.count() and self.collection.itemText(i) == name:
+                    continue
+                old = self.collection.findText(name)
+                if old >= 0:
+                    self.collection.removeItem(old)
+                self.collection.insertItem(i, name)
+            chosen = current if current in names else (names[0] if names else "")
+            if self.current_collection() != chosen:
+                self.collection.setText(chosen)
+        finally:
+            self.collection.blockSignals(False)
+        if self.current_collection() != current:
+            self.collection_changed(self.current_collection())
+        return True
 
     def read_collection_stdout(self) -> None:
         if not self.collection_process:
@@ -960,16 +924,19 @@ class IngestionWindow(QMainWindow):
         ).decode("utf-8", errors="replace")
         if text:
             self.collection_stderr_buffer += text
-            self.statusBar().showMessage(text.strip()[-300:])
+            if not self._collection_background:
+                self.statusBar().showMessage(text.strip()[-300:])
 
     def collection_finished(self, exit_code: int, _exit_status) -> None:
         text = self.collection_stdout_buffer.strip()
         error_text = self.collection_stderr_buffer.strip()
         action = self.collection_action
+        background = self._collection_background
         self.collection_stdout_buffer = ""
         self.collection_stderr_buffer = ""
         self.collection_process = None
         self.collection_action = None
+        self._collection_background = False
 
         if exit_code != 0:
             message = "Qdrant collection operation failed."
@@ -982,40 +949,44 @@ class IngestionWindow(QMainWindow):
                 detail = error_text.splitlines()[-1].strip()
             if detail:
                 message = f"{message} {detail}"
-            self.set_ui_state(UiState.READY)
-            self.statusBar().showMessage(message)
+            if not background:
+                self.set_ui_state(UiState.READY)
+            if self.statusBar().currentMessage() != message:
+                self.statusBar().showMessage(message)
             if action == "delete_many":
                 QMessageBox.critical(self, "Delete Collections Failed", message)
             if action == "contents":
-                self.contents_status.setText("Failed to load collection contents.")
+                message = "Failed to load collection contents."
+                if self.contents_status.text() != message:
+                    self.contents_status.setText(message)
             return
 
         try:
             payload = json.loads(text.splitlines()[-1]) if text else {}
         except Exception:
-            self.set_ui_state(UiState.READY)
-            self.statusBar().showMessage("Invalid collection worker response.")
+            if not background:
+                self.set_ui_state(UiState.READY)
+            message = "Invalid collection worker response."
+            if self.statusBar().currentMessage() != message:
+                self.statusBar().showMessage(message)
             if action == "contents":
-                self.contents_status.setText("Invalid collection contents response.")
+                message = "Invalid collection contents response."
+                if self.contents_status.text() != message:
+                    self.contents_status.setText(message)
             return
 
         if action == "list":
-            current = self.current_collection()
             names = payload.get("collections") or []
-            self.collection.blockSignals(True)
-            self.collection.clear()
-            self.collection.addItems(names)
-            if current in names:
-                self.collection.setText(current)
-            elif names:
-                self.collection.setText(names[0])
+            if background and self._collection_is_editing():
+                self._pending_collection_names = names
+                changed = False
             else:
-                self.collection.setText("")
-            self.collection.blockSignals(False)
-            if self.current_collection() != current:
-                self.collection_changed(self.current_collection())
-            self.set_ui_state(UiState.READY)
-            self.statusBar().showMessage(f"Loaded {len(names)} Qdrant collections.")
+                changed = self._apply_collection_names(names, background=background)
+            self._collections_seen_version = self._collections_loading_version
+            if not background:
+                self.set_ui_state(UiState.READY)
+                if changed:
+                    self.statusBar().showMessage(f"Loaded {len(names)} Qdrant collections.")
 
         elif action == "create":
             name = str(payload.get("collection") or self.current_collection())
@@ -1040,18 +1011,25 @@ class IngestionWindow(QMainWindow):
             self.collection.blockSignals(False)
             self.contents_table.setRowCount(0)
             self.collection_changed(self.current_collection())
-            self.contents_status.setText(f"Deleted {count} collection(s). Refreshing list…")
-            self.statusBar().showMessage(f"Deleted {count} collection(s). Refreshing list…")
+            self.contents_status.setText(f"Deleted {count} collection(s); collection list updating…")
+            self.statusBar().showMessage(f"Deleted {count} collection(s); collection list updating…")
             self.refresh_collections()
 
         elif action == "contents":
-            self._render_collection_contents(payload)
-            self.set_ui_state(UiState.READY)
-            self.statusBar().showMessage(
-                f"Loaded contents for {payload.get('collection') or self.current_collection()}."
-            )
+            if payload.get('collection') == self.current_collection():
+                self._render_collection_contents(payload)
+                self._displayed_contents_collection = self.current_collection()
+                self._contents_seen[self.current_collection()] = self._contents_loading_version
+            if not background:
+                self.set_ui_state(UiState.READY)
+                self.statusBar().showMessage(
+                    f"Loaded contents for {payload.get('collection') or self.current_collection()}."
+                )
         else:
-            self.set_ui_state(UiState.READY)
+            if not background:
+                self.set_ui_state(UiState.READY)
+        if action in ('list', 'contents'):
+            QTimer.singleShot(0, self._check_revisions)
 
     def run_retrieval(self) -> None:
         if self.ui_state != UiState.READY:
@@ -1071,8 +1049,6 @@ class IngestionWindow(QMainWindow):
         methods = []
         if self.retrieval_semantic.isChecked():
             methods.append("--semantic")
-        if self.retrieval_bge_lexical.isChecked():
-            methods.append("--bge-lexical")
         if self.retrieval_bm25.isChecked():
             methods.append("--bm25")
         if not methods:
@@ -1097,8 +1073,18 @@ class IngestionWindow(QMainWindow):
         self.retrieval_process.setWorkingDirectory(str(ROOT))
         self.retrieval_process.readyReadStandardOutput.connect(self.read_retrieval_stdout)
         self.retrieval_process.readyReadStandardError.connect(self.read_retrieval_stderr)
+        self.retrieval_process.errorOccurred.connect(self.retrieval_error)
         self.retrieval_process.finished.connect(self.retrieval_finished)
         self.retrieval_process.start()
+
+    def retrieval_error(self, error: QProcess.ProcessError) -> None:
+        if error != QProcess.ProcessError.FailedToStart or self.retrieval_process is None:
+            return
+        detail = self.retrieval_process.errorString()
+        self.retrieval_process = None
+        self.retrieval_stdout_buffer = ""
+        self.retrieval_status.setText(f"Search could not start: {detail}")
+        self.set_ui_state(UiState.READY)
 
     def read_retrieval_stdout(self) -> None:
         if not self.retrieval_process:
@@ -1115,13 +1101,20 @@ class IngestionWindow(QMainWindow):
             self.retrieval_results.appendPlainText(text[-8000:])
 
     def retrieval_finished(self, exit_code: int, _exit_status) -> None:
+        if self.retrieval_process is None:
+            return
         text = self.retrieval_stdout_buffer.strip()
         self.retrieval_stdout_buffer = ""
         self.retrieval_process = None
         self.set_ui_state(UiState.READY)
 
         if exit_code != 0:
-            self.retrieval_status.setText("Search failed.")
+            try:
+                failure = json.loads(text.splitlines()[-1])
+                detail = str(failure.get("message") or "").strip()
+            except (ValueError, IndexError, AttributeError):
+                detail = ""
+            self.retrieval_status.setText(f"Search failed: {detail}" if detail else "Search failed.")
             return
         try:
             payload = json.loads(text.splitlines()[-1])
@@ -1144,7 +1137,7 @@ class IngestionWindow(QMainWindow):
                     f"#{hit.get('rank')}  [{hit.get('retriever')}]  score={hit.get('score')}",
                     f"title: {hit.get('title')}",
                     f"page: {hit.get('page_start')} - {hit.get('page_end')}",
-                    f"section: {' > '.join(hit.get('section_path') or [])}",
+                    f"sections: {', '.join(hit.get('section_paths') or [])}",
                     f"source: {hit.get('source_uri')}",
                     "",
                     str(hit.get("content") or ""),
@@ -1158,14 +1151,11 @@ class IngestionWindow(QMainWindow):
         except Exception:
             state = {}
 
-        self.collection.setText(str(state.get("collection") or DEFAULT_NATIVE_COLLECTION))
+        self.collection.setText(str(state.get("collection") or ""))
         self.query.setText(str(state.get("retrieval_query") or ""))
 
         self.retrieval_semantic.setChecked(
             bool(state.get("retrieval_semantic", True))
-        )
-        self.retrieval_bge_lexical.setChecked(
-            bool(state.get("retrieval_bge_lexical", True))
         )
         self.retrieval_bm25.setChecked(
             bool(state.get("retrieval_bm25", True))
@@ -1195,7 +1185,6 @@ class IngestionWindow(QMainWindow):
             "collection": self.current_collection(),
             "retrieval_query": self.query.text(),
             "retrieval_semantic": self.retrieval_semantic.isChecked(),
-            "retrieval_bge_lexical": self.retrieval_bge_lexical.isChecked(),
             "retrieval_bm25": self.retrieval_bm25.isChecked(),
             "retrieval_rank_fusion": self.retrieval_rank_fusion.isChecked(),
             "retrieval_top_k": self.retrieval_top_k.value(),
@@ -1208,6 +1197,18 @@ class IngestionWindow(QMainWindow):
         tmp.replace(UI_STATE_PATH)
 
     def closeEvent(self, event) -> None:
+        self.change_debounce.stop()
+        # These are UI-owned collection/retrieval helpers, not ingestion workers.
+        # The detached ingestion manager must outlive this window.
+        for attr in ('collection_process', 'retrieval_process'):
+            process = getattr(self, attr, None)
+            if process is None:
+                continue
+            if process.state() != QProcess.ProcessState.NotRunning:
+                process.terminate()
+                if not process.waitForFinished(1500):
+                    process.kill()
+                    process.waitForFinished(3000)
         self.save_ui_state()
         super().closeEvent(event)
 

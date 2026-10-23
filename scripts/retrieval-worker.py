@@ -23,7 +23,6 @@ def main() -> int:
     ap.add_argument("--query", required=True)
     ap.add_argument("--collection", required=True)
     ap.add_argument("--semantic", action="store_true")
-    ap.add_argument("--bge-lexical", action="store_true")
     ap.add_argument("--bm25", action="store_true")
     ap.add_argument("--rank-fusion", action="store_true")
     ap.add_argument("--top-k", type=int, default=10)
@@ -32,18 +31,16 @@ def main() -> int:
 
     try:
         semantic = args.semantic
-        bge_lexical = args.bge_lexical
         bm25 = args.bm25
         rank_fusion = args.rank_fusion
 
-        if not any((semantic, bge_lexical, bm25)) and args.mode is None:
-            semantic = bge_lexical = bm25 = True
+        if not any((semantic, bm25)) and args.mode is None:
+            semantic = bm25 = True
             rank_fusion = True
 
         result = search(
             args.query,
             semantic=semantic,
-            bge_lexical=bge_lexical,
             bm25=bm25,
             rank_fusion=rank_fusion,
             top_k=args.top_k,

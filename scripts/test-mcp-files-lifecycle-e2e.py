@@ -47,7 +47,7 @@ async def main() -> None:
     collection = "__rag3_mcp_files_" + suffix
     env = os.environ.copy()
     env.update(RAG3_MCP_TRANSPORT="stdio", RAG3_MCP_WRITE_ENABLED="1",
-               RAG3_MCP_DELETE_ENABLED="1", RAG3_COLLECTION="my_rag1")
+               RAG3_MCP_DELETE_ENABLED="1", RAG3_COLLECTION="")
     params = StdioServerParameters(command=os.sys.executable,
         args=[str(ROOT / "scripts" / "rag3-mcp-server.py")], env=env, cwd=str(ROOT))
     async with stdio_client(params) as streams:
@@ -72,6 +72,8 @@ async def main() -> None:
             created = False
             jobs: list[str] = []
             try:
+                existing = await call("rag3_list_collections", {})
+                assert existing.get("collections"), "Create one default RAG3 collection before tests"
                 await call("rag3_create_collection", {"collection": collection})
                 created = True
                 await call("rag3_select_collection", {"collection": collection})
@@ -85,13 +87,16 @@ async def main() -> None:
                     "filename": "mcp-pause.pdf",
                     "content_base64": base64.b64encode(pdf).decode()})
                 jobs.append(submitted["job_id"])
+                index = await call("rag3_list_ingestion_jobs", {"collection": collection, "limit": 20})
+                assert submitted["job_id"] in {j["job_id"] for j in index["jobs"]}
                 paused_request = await call("rag3_pause_ingestion", {"job_id": submitted["job_id"]})
-                assert paused_request["status"] == "PAUSING"
+                assert paused_request["status"] in {"PAUSED", "PAUSING"}
                 paused = await wait_job(submitted["job_id"], {"PAUSED", "FAILED", "COMPLETE"})
                 assert paused["status"] == "PAUSED", paused
                 await call("rag3_resume_ingestion", {"job_id": submitted["job_id"]})
                 complete = await wait_job(submitted["job_id"], {"COMPLETE", "FAILED"})
                 assert complete["status"] == "COMPLETE", complete
+                assert complete["origin"] == "MCP" and not complete["checkpoint_available"]
 
                 docx = Document()
                 docx.add_paragraph("Amber forest " + suffix)
@@ -126,7 +131,7 @@ async def main() -> None:
                          for doc in docs["documents"]}
                 assert pages["mcp-pause"] == (1, 1), pages
                 hits = await call("rag3_search_advanced", {"query": phrase,
-                    "semantic": False, "bge_lexical": False, "bm25": True,
+                    "semantic": False, "bm25": True,
                     "rank_fusion": False, "top_k": 3})
                 assert hits["results"] and hits["results"][0]["page_start"] == 1, hits
                 fetched = await call("rag3_fetch", {"id": hits["results"][0]["id"]})
@@ -148,7 +153,11 @@ async def main() -> None:
                     if status["status"] in {"RUNNING", "RESUMING", "PAUSING"}:
                         await call("rag3_cancel_ingestion", {"job_id": job_id})
                         await wait_job(job_id, {"CANCELLED", "COMPLETE", "FAILED"}, 30)
-                await call("rag3_select_collection", {"collection": "my_rag1"})
+                others = await call("rag3_list_collections", {})
+                alternate = next((name for name in others.get("collections", []) if name != collection), None)
+                if alternate is None:
+                    raise AssertionError("A non-test collection is needed for safe deletion")
+                await call("rag3_select_collection", {"collection": alternate})
                 if created:
                     await call("rag3_delete_collection", {"collection": collection,
                         "confirm_collection": collection})

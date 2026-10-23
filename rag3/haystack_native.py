@@ -10,14 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
-from FlagEmbedding import BGEM3FlagModel
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.accelerator_options import AcceleratorDevice
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
 from docling.document_converter import DocumentConverter as DoclingDocumentConverter, PdfFormatOption
 from docling_core.transforms.serializer.markdown import MarkdownDocSerializer, MarkdownParams
 from haystack import Document, Pipeline, component
-from haystack.dataclasses import SparseEmbedding
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.components.preprocessors import DocumentSplitter
 from haystack.components.writers import DocumentWriter
@@ -30,9 +28,11 @@ from qdrant_client import QdrantClient, models as qdrant_models
 
 from rag3.source_identity import sha256_file
 from rag3.constants import ROOT, DEFAULT_QDRANT_URL, DEFAULT_NATIVE_COLLECTION
+from rag3.ingestion_settings import (
+    BGE_BATCH_SIZE, DEFAULT_SPLIT_LENGTH, DEFAULT_SPLIT_OVERLAP,
+    find_bge_m3 as find_local_bge_m3,
+)
 
-DEFAULT_SPLIT_LENGTH = 1024
-DEFAULT_SPLIT_OVERLAP = 128
 DEFAULT_DOCLING_MODEL_DIR = ROOT / "data" / "models" / "docling"
 BM25_VECTOR_NAME = "bm25"
 DEFAULT_BM25_K = 1.2
@@ -46,29 +46,17 @@ def _utc_now() -> str:
 
 
 def find_bge_m3() -> Path:
-    roots = (ROOT / "data" / "models" / "huggingface", ROOT / "data" / "models")
-    for base in roots:
-        if not base.exists():
-            continue
-        candidates: list[Path] = []
-        for cfg in base.rglob("config.json"):
-            p = cfg.parent
-            s = str(p).lower()
-            if ("bge-m3" in s or "bge_m3" in s or "bge--m3" in s) and (
-                (p / "tokenizer.json").exists() or (p / "tokenizer_config.json").exists()
-            ):
-                candidates.append(p)
-        if candidates:
-            return sorted(set(candidates), key=lambda p: (len(str(p)), str(p)))[0]
-    raise RuntimeError("Local BGE-M3 model directory not found under data/models")
+    return find_local_bge_m3()
 
 
-def preserve_source(source: str | Path) -> dict[str, Any]:
+def preserve_source(source: str | Path, *, expected_sha256: str | None = None) -> dict[str, Any]:
     src = Path(source).expanduser().resolve()
     if not src.is_file():
         raise FileNotFoundError(src)
 
-    source_sha = sha256_file(src)
+    source_sha = expected_sha256 or sha256_file(src)
+    if len(source_sha) != 64 or any(char not in "0123456789abcdef" for char in source_sha):
+        raise ValueError("invalid source SHA-256")
     dest_dir = ROOT / "data" / "sources" / source_sha
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / src.name
@@ -92,13 +80,12 @@ def preserve_source(source: str | Path) -> dict[str, Any]:
 
 
 def prepare_docling_source(preserved: dict[str, Any]) -> Path:
-    """Convert legacy Word DOC to DOCX before the existing Docling pipeline.
-
-    The original managed source and its SHA/document identity stay unchanged.
-    The converted file is only a parser input, shared by UI and MCP workers.
-    """
+    """Convert legacy DOC to DOCX; other formats use their managed original."""
     source = Path(preserved["managed_source"])
-    if source.suffix.lower() != ".doc":
+    suffix = source.suffix.lower()
+    if suffix in {".txt", ".json", ".jsonl", ".tsv"}:
+        raise ValueError("Plain text sources should go directly to the token splitter")
+    if suffix != ".doc":
         return source
     if os.name != "nt":
         raise RuntimeError("Legacy DOC ingestion requires Microsoft Word on Windows")
@@ -144,11 +131,32 @@ def prepare_docling_source(preserved: dict[str, Any]) -> Path:
         temporary.unlink(missing_ok=True)
 
 
+PLAIN_TEXT_SUFFIXES = frozenset({".txt", ".json", ".jsonl", ".tsv"})
+
+
+def split_plain_text_source(
+    preserved: dict[str, Any], base_meta: dict[str, Any],
+    *, split_length: int = DEFAULT_SPLIT_LENGTH,
+    split_overlap: int = DEFAULT_SPLIT_OVERLAP,
+) -> list[Document]:
+    source = Path(preserved["managed_source"])
+    if source.suffix.lower() not in PLAIN_TEXT_SUFFIXES:
+        raise ValueError("Not a plain text source")
+    content = source.read_text(encoding="utf-8-sig")
+    if not content.strip():
+        raise ValueError("text file must not be empty")
+    splitter = DocumentSplitter(
+        split_by="token", split_length=split_length,
+        split_overlap=split_overlap, tokenizer_encoding="o200k_base",
+    )
+    return splitter.run(documents=[Document(content=content, meta=base_meta)])["documents"]
+
+
 
 def _bm25_metadata(k: float, b: float, avg_len: float) -> dict[str, Any]:
     return {
         "rag3": {
-            "schema_version": 2,
+            "schema_version": 3,
             "bm25": {
                 "vector_name": BM25_VECTOR_NAME,
                 "model": "qdrant/bm25",
@@ -237,7 +245,7 @@ class QdrantBM25Writer:
         config = collection_bm25_config(self.collection, url=self.url)
         qdrant_points = convert_haystack_documents_to_qdrant_points(
             documents,
-            use_sparse_embeddings=True,
+            use_sparse_embeddings=False,
         )
         updates = [
             qdrant_models.PointVectors(
@@ -386,14 +394,46 @@ def _page_range_from_split_meta(
     return page_start, page_end
 
 
+def normalize_chunk(doc: Document, idx: int) -> Document:
+    """Assign the final stable ID and metadata before a vector is available."""
+    content = doc.content or ""
+    content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    meta = dict(doc.meta or {})
+    page_start, page_end = _page_range_from_split_meta(meta, len(content))
+    for temporary in ("_rag3_page_breaks", "_rag3_first_page", "_rag3_last_page", "section_path"):
+        meta.pop(temporary, None)
+    source_sha = str(meta.get("source_sha256") or "")
+    chunk_index = int(meta.get("chunk_index", idx))
+    chunk_id = hashlib.sha256(
+        f"{source_sha}:{chunk_index}:{content_sha}".encode("utf-8")
+    ).hexdigest()
+    now = _utc_now()
+    meta.update({
+        "chunk_id": chunk_id,
+        "document_id": meta.get("document_id") or source_sha,
+        "chunk_index": chunk_index,
+        "title": meta.get("title"),
+        "source_uri": meta.get("source_uri"),
+        "source_sha256": source_sha,
+        "page_start": page_start,
+        "page_end": page_end,
+        "content_type": meta.get("content_type") or "prose",
+        "document_version": meta.get("document_version") or "1",
+        "content_sha256": content_sha,
+        "created_at": meta.get("created_at") or now,
+        "updated_at": now,
+    })
+    return Document(id=chunk_id, content=content, meta=meta)
+
+
 @component
 class BGEM3OnePassEmbedder:
-    """Haystack component that emits BGE-M3 dense + lexical sparse vectors in one model encode call."""
+    """Haystack component that emits only BGE-M3 dense vectors."""
 
     def __init__(
         self,
         model_path: str | None = None,
-        batch_size: int = 8,
+        batch_size: int = BGE_BATCH_SIZE,
         max_length: int = 8192,
         device: str | None = None,
     ) -> None:
@@ -406,6 +446,9 @@ class BGEM3OnePassEmbedder:
     def warm_up(self) -> None:
         if self._model is not None:
             return
+        import torch
+        from FlagEmbedding import BGEM3FlagModel
+
         device = self.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         self._model = BGEM3FlagModel(
             self.model_path,
@@ -414,7 +457,7 @@ class BGEM3OnePassEmbedder:
             devices=device,
         )
 
-    def _encode(self, texts: list[str], *, query: bool) -> tuple[list[list[float]], list[SparseEmbedding]]:
+    def _encode(self, texts: list[str], *, query: bool) -> list[list[float]]:
         self.warm_up()
         if self._model is None:
             raise RuntimeError("BGE-M3 model did not initialize")
@@ -423,7 +466,7 @@ class BGEM3OnePassEmbedder:
             batch_size=self.batch_size,
             max_length=self.max_length,
             return_dense=True,
-            return_sparse=True,
+            return_sparse=False,
             return_colbert_vecs=False,
         )
         if query and hasattr(self._model, "encode_queries"):
@@ -439,21 +482,11 @@ class BGEM3OnePassEmbedder:
         norms = np.linalg.norm(dense_arr, axis=1, keepdims=True)
         dense_arr = dense_arr / np.where(norms == 0.0, 1.0, norms)
 
-        sparse_out: list[SparseEmbedding] = []
-        for lexical in out["lexical_weights"]:
-            pairs = sorted((int(k), float(v)) for k, v in lexical.items() if float(v) > 0.0)
-            sparse_out.append(
-                SparseEmbedding(
-                    indices=[i for i, _ in pairs],
-                    values=[v for _, v in pairs],
-                )
-            )
-        return dense_arr.tolist(), sparse_out
+        return dense_arr.tolist()
 
     @component.output_types(
         documents=list[Document],
         embedding=list[float],
-        sparse_embedding=SparseEmbedding,
     )
     def run(
         self,
@@ -464,11 +497,10 @@ class BGEM3OnePassEmbedder:
             raise ValueError("Provide exactly one of documents or text")
 
         if text is not None:
-            dense, sparse = self._encode([text], query=True)
+            dense = self._encode([text], query=True)
             return {
                 "documents": [],
                 "embedding": dense[0],
-                "sparse_embedding": sparse[0],
             }
 
         assert documents is not None
@@ -476,60 +508,26 @@ class BGEM3OnePassEmbedder:
             return {
                 "documents": [],
                 "embedding": [],
-                "sparse_embedding": SparseEmbedding(indices=[], values=[]),
             }
 
         texts = [(doc.content or "") for doc in documents]
-        dense, sparse = self._encode(texts, query=False)
-        now = _utc_now()
+        dense = self._encode(texts, query=False)
         embedded: list[Document] = []
 
-        for idx, (doc, dvec, svec) in enumerate(zip(documents, dense, sparse, strict=True)):
-            content = doc.content or ""
-            content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            meta = dict(doc.meta or {})
-            page_start, page_end = _page_range_from_split_meta(meta, len(content))
-            meta.pop("_rag3_page_breaks", None)
-            meta.pop("_rag3_first_page", None)
-            meta.pop("_rag3_last_page", None)
-            source_sha = str(meta.get("source_sha256") or "")
-            chunk_index = int(meta.get("chunk_index", idx))
-            chunk_id = hashlib.sha256(
-                f"{source_sha}:{chunk_index}:{content_sha}".encode("utf-8")
-            ).hexdigest()
-
-            meta.update(
-                {
-                    "chunk_id": chunk_id,
-                    "document_id": meta.get("document_id") or source_sha,
-                    "chunk_index": chunk_index,
-                    "title": meta.get("title"),
-                    "source_uri": meta.get("source_uri"),
-                    "source_sha256": source_sha,
-                    "page_start": page_start,
-                    "page_end": page_end,
-                    "section_path": meta.get("section_path") or [],
-                    "content_type": meta.get("content_type") or "prose",
-                    "document_version": meta.get("document_version") or "1",
-                    "content_sha256": content_sha,
-                    "created_at": meta.get("created_at") or now,
-                    "updated_at": now,
-                }
-            )
+        for idx, (doc, dvec) in enumerate(zip(documents, dense, strict=True)):
+            normalized = normalize_chunk(doc, idx)
             embedded.append(
                 Document(
-                    id=chunk_id,
-                    content=content,
-                    meta=meta,
+                    id=normalized.id,
+                    content=normalized.content,
+                    meta=normalized.meta,
                     embedding=dvec,
-                    sparse_embedding=svec,
                 )
             )
 
         return {
             "documents": embedded,
             "embedding": [],
-            "sparse_embedding": SparseEmbedding(indices=[], values=[]),
         }
 
 
@@ -542,6 +540,8 @@ def create_document_store(
     bm25_b: float = DEFAULT_BM25_B,
     bm25_avg_len: float = DEFAULT_BM25_AVG_LEN,
 ) -> QdrantDocumentStore:
+    from rag3.ingestion_jobs import mark_change
+
     client = QdrantClient(url=url)
 
     if recreate_index and client.collection_exists(collection):
@@ -557,13 +557,13 @@ def create_document_store(
                 )
             },
             sparse_vectors_config={
-                "text-sparse": qdrant_models.SparseVectorParams(),
                 BM25_VECTOR_NAME: qdrant_models.SparseVectorParams(
                     modifier=qdrant_models.Modifier.IDF
                 ),
             },
             metadata=_bm25_metadata(bm25_k, bm25_b, bm25_avg_len),
         )
+        mark_change('collections')
     else:
         _collection_bm25_settings(client, collection)
 
@@ -571,6 +571,8 @@ def create_document_store(
         url=url,
         index=collection,
         embedding_dim=1024,
+        # Haystack uses this flag to address the named "text-dense" vector.
+        # Documents carry no BGE sparse_embedding, so none is written.
         use_sparse_embeddings=True,
         similarity="cosine",
         recreate_index=False,
@@ -579,24 +581,34 @@ def create_document_store(
     )
 
 
-def build_ingestion_pipeline(
-    *,
-    document_store: QdrantDocumentStore,
-    model_path: str | None = None,
-    split_length: int = DEFAULT_SPLIT_LENGTH,
+def build_parsing_pipeline(
+    *, split_length: int = DEFAULT_SPLIT_LENGTH,
     split_overlap: int = DEFAULT_SPLIT_OVERLAP,
+    pdf_cpu: bool = False,
 ) -> Pipeline:
     pdf_options = PdfPipelineOptions()
     if hasattr(pdf_options, "do_ocr"):
         pdf_options.do_ocr = True
     if hasattr(pdf_options, "do_table_structure"):
         pdf_options.do_table_structure = True
+        pdf_options.table_structure_options.mode = TableFormerMode.FAST
     if hasattr(pdf_options, "generate_picture_images"):
-        pdf_options.generate_picture_images = True
+        pdf_options.generate_picture_images = False
+    if hasattr(pdf_options, "do_picture_classification"):
+        pdf_options.do_picture_classification = False
+    if hasattr(pdf_options, "do_picture_description"):
+        pdf_options.do_picture_description = False
     if hasattr(pdf_options, "generate_page_images"):
         pdf_options.generate_page_images = False
+    if hasattr(pdf_options, "generate_table_images"):
+        pdf_options.generate_table_images = False
     if hasattr(pdf_options, "images_scale"):
-        pdf_options.images_scale = 2.0
+        pdf_options.images_scale = 1.0
+    if hasattr(pdf_options, "queue_max_size"):
+        pdf_options.queue_max_size = 8
+    if pdf_cpu:
+        pdf_options.accelerator_options.device = AcceleratorDevice.CPU
+        pdf_options.accelerator_options.num_threads = 2
     if hasattr(pdf_options, "artifacts_path"):
         pdf_options.artifacts_path = DEFAULT_DOCLING_MODEL_DIR
 
@@ -623,6 +635,22 @@ def build_ingestion_pipeline(
             tokenizer_encoding="o200k_base",
         ),
     )
+    pipe.connect("converter.documents", "splitter.documents")
+    return pipe
+
+
+def build_ingestion_pipeline(
+    *,
+    document_store: QdrantDocumentStore,
+    model_path: str | None = None,
+    split_length: int = DEFAULT_SPLIT_LENGTH,
+    split_overlap: int = DEFAULT_SPLIT_OVERLAP,
+) -> Pipeline:
+    pipe = build_parsing_pipeline(
+        split_length=split_length, split_overlap=split_overlap
+    )
+    # The direct helper retains its Haystack writer path. UI/MCP ingestion uses
+    # separate parsing and embedding processes with bounded Qdrant batches.
     pipe.add_component("embedder", BGEM3OnePassEmbedder(model_path=model_path))
     pipe.add_component(
         "writer",
@@ -635,7 +663,6 @@ def build_ingestion_pipeline(
         "bm25_writer",
         QdrantBM25Writer(collection=document_store.index),
     )
-    pipe.connect("converter.documents", "splitter.documents")
     pipe.connect("splitter.documents", "embedder.documents")
     pipe.connect("embedder.documents", "writer.documents")
     pipe.connect("embedder.documents", "bm25_writer.documents")
@@ -652,14 +679,11 @@ def ingest_source(
     model_path: str | None = None,
 ) -> dict[str, Any]:
     preserved = preserve_source(source)
-    docling_source = prepare_docling_source(preserved)
     store = create_document_store(
         collection=collection,
         url=qdrant_url,
         recreate_index=recreate_index,
     )
-    pipe = build_ingestion_pipeline(document_store=store, model_path=model_path)
-
     base_meta = {
         "document_id": preserved["document_id"],
         "title": preserved["title"],
@@ -667,22 +691,35 @@ def ingest_source(
         "source_sha256": preserved["source_sha256"],
         "page_start": None,
         "page_end": None,
-        "section_path": [],
         "content_type": "prose",
         "document_version": "1",
     }
 
     before = store.count_documents()
-    result = pipe.run(
-        {
-            "converter": {
-                "sources": [str(docling_source)],
-                "meta": base_meta,
-            }
-        },
-        include_outputs_from={"writer", "bm25_writer"},
-    )
+    if Path(preserved["managed_source"]).suffix.lower() in PLAIN_TEXT_SUFFIXES:
+        chunks = split_plain_text_source(preserved, base_meta)
+        embedded = BGEM3OnePassEmbedder(model_path=model_path).run(documents=chunks)["documents"]
+        written = store.write_documents(embedded, policy=DuplicatePolicy.OVERWRITE)
+        bm25_written = QdrantBM25Writer(collection=collection, url=qdrant_url).run(
+            documents=embedded, documents_written=written,
+        )["bm25_vectors_written"]
+    else:
+        docling_source = prepare_docling_source(preserved)
+        pipe = build_ingestion_pipeline(document_store=store, model_path=model_path)
+        result = pipe.run(
+            {
+                "converter": {
+                    "sources": [str(docling_source)],
+                    "meta": base_meta,
+                }
+            },
+            include_outputs_from={"writer", "bm25_writer"},
+        )
+        written = result.get("writer", {}).get("documents_written")
+        bm25_written = result.get("bm25_writer", {}).get("bm25_vectors_written")
     after = store.count_documents()
+    from rag3.ingestion_jobs import content_scope, mark_change
+    mark_change(content_scope(collection))
 
     return {
         "source_sha256": preserved["source_sha256"],
@@ -690,6 +727,6 @@ def ingest_source(
         "collection": collection,
         "count_before": before,
         "count_after": after,
-        "documents_written": result.get("writer", {}).get("documents_written"),
-        "bm25_vectors_written": result.get("bm25_writer", {}).get("bm25_vectors_written"),
+        "documents_written": written,
+        "bm25_vectors_written": bm25_written,
     }

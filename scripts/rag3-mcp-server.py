@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from typing_extensions import NotRequired, TypedDict
 
 from pydantic import Field, StrictBool, StrictInt
@@ -29,7 +29,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
 from rag3.collections import (collection_contents, create_collection,
                               delete_collections, delete_document,
-                              get_document, list_collections)
+                              get_document, list_collections, update_chunk_sections)
 from rag3.mcp_jobs import JobManager
 from rag3.sources import SourceError, render_page, source_metadata, source_part
 
@@ -48,8 +48,11 @@ MAX_FETCH_CHARS = 12_000
 REF_PREFIX = "r3v1"
 
 SERVER_INSTRUCTIONS = """Use rag3_list_collections and rag3_select_collection to choose a RAG3 collection.
+Use rag3_list_ingestion_jobs to recover job IDs after reconnecting; jobs from UI and MCP share the same queue.
 Use rag3_search for retrieval and rag3_fetch to read source chunks.
-Search uses the existing RAG3 hybrid retrieval policy.
+Use rag3_search_flexible when a request needs metadata conditions or a per-request collection.
+Only when the user requests section annotation, inspect chunks with rag3_get_document and use rag3_update_chunk_metadata to preview and apply numeric chapter/section paths.
+Search uses semantic BGE-M3 and Qdrant BM25 with rank fusion by default.
 Read relevant sources with rag3_fetch(id, offset=excerpt_offset); use offset=0 to read from the beginning.
 Use the same ID with next_offset to continue the same chunk. Use next_id with offset=0 to read the next chunk.
 Neighbor IDs do not depend on how much text fits in a response. If neighbors_known is false, adjacency is unknown.
@@ -101,6 +104,11 @@ class AttachmentInput(TypedDict):
     file_id: str
     mime_type: NotRequired[str]
     file_name: NotRequired[str]
+
+
+class SectionUpdateInput(TypedDict):
+    point_id: str
+    section_paths: list[str]
 
 
 class ToolFailure(Exception):
@@ -355,7 +363,7 @@ def _search_impl(query: str, options: dict | None = None) -> dict:
     output: list[SearchResult] = []
     seen: set[str] = set()
     if options and "top_k" in options:
-        method_count = sum(bool(options.get(key)) for key in ("semantic", "bge_lexical", "bm25"))
+        method_count = sum(bool(options.get(key)) for key in ("semantic", "bm25"))
         result_limit = options["top_k"] * (1 if options.get("rank_fusion") else method_count)
     else:
         result_limit = MAX_SEARCH_RESULTS
@@ -515,8 +523,8 @@ WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint
 DELETE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 
 
-def _locked_search(query: str, options: dict | None = None) -> dict:
-    selected = _selected_collection()
+def _locked_search(query: str, options: dict | None = None, collection: str | None = None) -> dict:
+    selected = _collection_name(collection) if collection else _selected_collection()
     token = _CALL_COLLECTION.set(selected)
     try:
         return _search_impl(query, options)
@@ -537,7 +545,7 @@ def _locked_fetch(ref_id: str, offset: int) -> dict:
     name="rag3_search",
     title="RAG3 문서 검색",
     description=(
-        "Search the configured RAG3 PDF collection using the existing core's default hybrid retrieval policy. "
+        "Search the configured RAG3 PDF collection using semantic BGE-M3 and BM25 rank fusion. "
         "Returns up to 8 results in the core's order, with source IDs and chunk PDF page ranges. "
         "Excerpts use existing core-provided source locations when available; prefix_fallback means no relevant "
         "location was established. Read sources with rag3_fetch(id, offset=excerpt_offset); an excerpt alone is "
@@ -587,19 +595,55 @@ async def rag3_fetch(
 async def rag3_search_advanced(
     query: Annotated[str, Field(min_length=1, max_length=2000)],
     semantic: StrictBool = True,
-    bge_lexical: StrictBool = True,
     bm25: StrictBool = True,
     rank_fusion: StrictBool = True,
     top_k: Annotated[StrictInt, Field(ge=1, le=100)] = 10,
 ) -> Annotated[CallToolResult, SearchOutput]:
-    if not any((semantic, bge_lexical, bm25)):
+    if not any((semantic, bm25)):
         return _error("INVALID_ARGUMENT", "Select at least one retrieval method.")
-    if rank_fusion and sum((semantic, bge_lexical, bm25)) < 2:
+    if rank_fusion and sum((semantic, bm25)) < 2:
         return _error("INVALID_ARGUMENT", "Rank fusion requires at least two methods.")
     return await _run_tool(_locked_search, query, {
-        "semantic": semantic, "bge_lexical": bge_lexical, "bm25": bm25,
+        "semantic": semantic, "bm25": bm25,
         "rank_fusion": rank_fusion, "top_k": top_k,
     })
+
+
+@mcp.tool(name="rag3_search_flexible", title="RAG3 범용 검색",
+          description=(
+              "Search any stored chunk metadata field using a Qdrant filter object. "
+              "Use payload keys prefixed with meta., such as meta.document_id, meta.title, "
+              "meta.page_start, meta.section_paths, or meta.section_scopes. Example: "
+              "metadata_filter={'must':[{'key':'meta.document_id','match':{'value':'DOCUMENT_ID'}}]}. "
+              "Combine conditions with must (AND), should (OR), and must_not (NOT); "
+              "use match, range, or other Qdrant field conditions appropriate to the stored value. "
+              "The filter is applied to every selected retrieval method before RRF fusion. "
+              "Omit collection to use the server selection; an explicit collection applies only to this call. "
+              "For a section such as 2.3 and its descendants, match meta.section_scopes=2.3. "
+              "Fields without stored values cannot match."
+          ),
+          annotations=READ_ONLY, structured_output=True)
+async def rag3_search_flexible(
+    query: Annotated[str, Field(min_length=1, max_length=2000)],
+    metadata_filter: dict[str, Any] | None = None,
+    collection: str = "",
+    semantic: StrictBool = True,
+    bm25: StrictBool = True,
+    rank_fusion: StrictBool = True,
+    top_k: Annotated[StrictInt, Field(ge=1, le=100)] = 10,
+    candidate_k: Annotated[StrictInt, Field(ge=1, le=1000)] | None = None,
+) -> Annotated[CallToolResult, SearchOutput]:
+    if not any((semantic, bm25)):
+        return _error("INVALID_ARGUMENT", "Select at least one retrieval method.")
+    if rank_fusion and sum((semantic, bm25)) < 2:
+        return _error("INVALID_ARGUMENT", "Rank fusion requires at least two methods.")
+    if candidate_k is not None and (not rank_fusion or candidate_k < top_k):
+        return _error("INVALID_ARGUMENT", "candidate_k requires rank fusion and must be >= top_k.")
+    return await _run_tool(_locked_search, query, {
+        "semantic": semantic, "bm25": bm25,
+        "rank_fusion": rank_fusion, "top_k": top_k,
+        "candidate_k": candidate_k, "metadata_filter": metadata_filter,
+    }, collection or None)
 
 
 @mcp.tool(name="rag3_list_collections", title="RAG3 컬렉션 목록",
@@ -664,11 +708,12 @@ async def rag3_delete_collection(collection: str, confirm_collection: str) -> An
 
 
 @mcp.tool(name="rag3_ingest_file", title="RAG3 파일 수집",
-          description="Ingest the original attached PDF, DOC, DOCX, or UTF-8 MD file unchanged. "
+          description="Ingest the original attached PDF, DOC, DOCX, MD, TXT, JSON, JSONL, CSV, or TSV file unchanged. "
+                      "Text formats must use UTF-8. "
                       "For ChatGPT attachments pass the file object supplied by the host; "
                       "do not ask the user to Base64-encode files or replace PDFs with extracted text. "
-                      "No application file-size limit. Returns a job ID immediately while the original "
-                      "file is downloaded and ingested; poll rag3_ingestion_status. "
+                      "No application file-size limit. Returns a job ID for the common execution queue; downloads may begin immediately "
+                      "while a worker waits for the single available slot; poll rag3_ingestion_status. "
                       "filename/content_base64 remain optional for legacy local clients only.",
           annotations=WRITE, meta={"openai/fileParams": ["file"]}, structured_output=True)
 async def rag3_ingest_file(collection: str, filename: str = "", content_base64: str = "",
@@ -697,14 +742,23 @@ async def rag3_ingest_text(collection: str, title: str, text: str) -> Annotated[
 
 
 @mcp.tool(name="rag3_ingestion_status", title="RAG3 수집 상태",
-          description="Read status, stage, and result for an MCP ingestion job.",
+          description="Read status, stage, result, origin and checkpoint availability of a UI or MCP ingestion job.",
           annotations=READ_ONLY, structured_output=True)
 async def rag3_ingestion_status(job_id: str) -> Annotated[CallToolResult, dict[str, Any]]:
     return await _run_tool(JOBS.status, job_id)
 
 
+@mcp.tool(name="rag3_list_ingestion_jobs", title="RAG3 수집 작업 목록",
+          description="Read-only list of UI and MCP ingestion job IDs, newest first. Optional collection/status filters, page limit 1..200 and offset; excludes original local paths and signed URLs.",
+          annotations=READ_ONLY, structured_output=True)
+async def rag3_list_ingestion_jobs(collection: str = "", status: str = "",
+                                  limit: Annotated[StrictInt, Field(ge=1,le=200)] = 50,
+                                  offset: Annotated[StrictInt, Field(ge=0)] = 0) -> Annotated[CallToolResult, dict[str, Any]]:
+    return await _run_tool(JOBS.list, collection, status, limit, offset)
+
+
 @mcp.tool(name="rag3_pause_ingestion", title="RAG3 수집 일시정지",
-          description="Request pause at the next checkpoint in the existing ingestion worker.",
+          description="Request PAUSING; the active worker pauses after document conversion or the next chunk group. Queued jobs pause without starting.",
           annotations=WRITE, structured_output=True)
 async def rag3_pause_ingestion(job_id: str) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
@@ -714,7 +768,7 @@ async def rag3_pause_ingestion(job_id: str) -> Annotated[CallToolResult, dict[st
 
 
 @mcp.tool(name="rag3_resume_ingestion", title="RAG3 수집 재개",
-          description="Resume an MCP job from its existing Haystack checkpoint.",
+          description="Resume a UI or MCP job from its Qdrant ingestion progress (or an unstarted paused queue item).",
           annotations=WRITE, structured_output=True)
 async def rag3_resume_ingestion(job_id: str) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
@@ -724,7 +778,7 @@ async def rag3_resume_ingestion(job_id: str) -> Annotated[CallToolResult, dict[s
 
 
 @mcp.tool(name="rag3_cancel_ingestion", title="RAG3 수집 취소",
-          description="Cancel a running MCP job while preserving any checkpoint.",
+          description="Cancel a UI or MCP job. Running worker is terminated; staged Qdrant chunks remain for retry.",
           annotations=WRITE, structured_output=True)
 async def rag3_cancel_ingestion(job_id: str) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
@@ -753,8 +807,34 @@ async def rag3_get_document(
                                                  chunk_limit=chunk_limit))
 
 
+@mcp.tool(name="rag3_update_chunk_metadata", title="RAG3 청크 장절 메타데이터 갱신",
+          description="Add or replace numeric chapter/section paths on up to 100 existing chunks of one document. "
+                      "Get point_id and chunk text from rag3_get_document; inspect the content before assigning paths. "
+                      "Use section_paths such as ['2.3', '2.3.1']; one chunk may have several paths. "
+                      "add merges with prior paths; replace corrects or clears them. "
+                      "section_scopes is derived for parent/descendant search. "
+                      "dry_run defaults to true and previews every change; call again with dry_run=false to apply. "
+                      "Only section metadata is writable. Run only when the user requests annotation.",
+          annotations=WRITE, structured_output=True)
+async def rag3_update_chunk_metadata(
+    collection: str, document_id: str,
+    updates: Annotated[list[SectionUpdateInput], Field(min_length=1, max_length=100)],
+    mode: Literal["add", "replace"] = "add",
+    dry_run: StrictBool = True,
+) -> Annotated[CallToolResult, dict[str, Any]]:
+    def run() -> dict:
+        name = _collection_name(collection)
+        if not dry_run:
+            _require_write()
+            if JOBS.has_active_collection(name):
+                raise ValueError("collection has an active ingestion job")
+        return update_chunk_sections(name, document_id, updates, mode=mode,
+                                     dry_run=dry_run, url=QDRANT_URL)
+    return await _run_tool(run)
+
+
 @mcp.tool(name="rag3_get_source", title="RAG3 원본 파일 가져오기",
-          description="Get the verified original PDF/DOC/DOCX/MD for a RAG3 document. "
+          description="Get the verified original PDF/DOC/DOCX/MD/TXT/JSON/JSONL/CSV/TSV for a RAG3 document. "
                       "The download card receives the original bytes over the existing authenticated MCP "
                       "connection, without a file-size cap or exposing a local path/public download URL. "
                       "Use document_id from search or list_documents. collection defaults to the selected "

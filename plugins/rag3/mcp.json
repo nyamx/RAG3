@@ -3,8 +3,8 @@
   "mcpServers": {
     "rag3": {
       "type": "stdio",
-      "command": "cmd.exe",
-      "args": ["/d", "/c", "${PLUGIN_ROOT}/run-rag3.cmd"],
+      "command": "C:\\python_program\\RAG3\\.venv\\Scripts\\pythonw.exe",
+      "args": ["C:\\python_program\\RAG3\\scripts\\rag3-mcp-server.py"],
       "env": {
         "RAG3_PROJECT_ROOT": "C:\\python_program\\RAG3",
         "RAG3_MCP_TRANSPORT": "stdio",

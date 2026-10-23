@@ -4,15 +4,8 @@ import threading
 from typing import Literal
 
 from haystack import Pipeline
-from haystack_integrations.components.retrievers.qdrant import (
-    QdrantEmbeddingRetriever,
-    QdrantHybridRetriever,
-    QdrantSparseEmbeddingRetriever,
-)
-from haystack_integrations.document_stores.qdrant.converters import (
-    DENSE_VECTORS_NAME,
-    SPARSE_VECTORS_NAME,
-)
+from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
+from haystack_integrations.document_stores.qdrant.converters import DENSE_VECTORS_NAME
 from qdrant_client import QdrantClient, models as qdrant_models
 
 from rag3.haystack_native import (
@@ -27,7 +20,6 @@ from rag3.haystack_native import (
 Mode = Literal["dense", "sparse", "hybrid"]
 
 SEMANTIC = "bge_m3_semantic"
-BGE_LEXICAL = "bge_m3_lexical"
 BM25_LEXICAL = "bm25"
 _QUERY_EMBEDDERS: dict[str | None, BGEM3OnePassEmbedder] = {}
 _QUERY_EMBEDDER_LOCK = threading.RLock()
@@ -45,13 +37,15 @@ def _embed_query(query: str, model_path: str | None) -> dict:
 
 def build_retrieval_pipeline(
     *,
-    mode: Mode = "hybrid",
+    mode: Mode = "dense",
     collection: str = DEFAULT_NATIVE_COLLECTION,
     qdrant_url: str = DEFAULT_QDRANT_URL,
     model_path: str | None = None,
     top_k: int = 10,
 ) -> Pipeline:
-    " ""Compatibility pipeline for the original dense/sparse/hybrid Haystack path." ""
+    """Build the Haystack dense path; use search() for BM25 or fused retrieval."""
+    if mode != "dense":
+        raise ValueError("Use search() for BM25 or semantic+BM25 retrieval")
     store = create_document_store(
         collection=collection,
         url=qdrant_url,
@@ -61,33 +55,13 @@ def build_retrieval_pipeline(
     pipe = Pipeline()
     pipe.add_component("query_embedder", BGEM3OnePassEmbedder(model_path=model_path))
 
-    if mode == "dense":
-        retriever = QdrantEmbeddingRetriever(
-            document_store=store,
-            top_k=top_k,
-            return_embedding=False,
-        )
-        pipe.add_component("retriever", retriever)
-        pipe.connect("query_embedder.embedding", "retriever.query_embedding")
-    elif mode == "sparse":
-        retriever = QdrantSparseEmbeddingRetriever(
-            document_store=store,
-            top_k=top_k,
-            return_embedding=False,
-        )
-        pipe.add_component("retriever", retriever)
-        pipe.connect("query_embedder.sparse_embedding", "retriever.query_sparse_embedding")
-    elif mode == "hybrid":
-        retriever = QdrantHybridRetriever(
-            document_store=store,
-            top_k=top_k,
-            return_embedding=False,
-        )
-        pipe.add_component("retriever", retriever)
-        pipe.connect("query_embedder.embedding", "retriever.query_embedding")
-        pipe.connect("query_embedder.sparse_embedding", "retriever.query_sparse_embedding")
-    else:
-        raise ValueError(f"Unsupported retrieval mode: {mode}")
+    retriever = QdrantEmbeddingRetriever(
+        document_store=store,
+        top_k=top_k,
+        return_embedding=False,
+    )
+    pipe.add_component("retriever", retriever)
+    pipe.connect("query_embedder.embedding", "retriever.query_embedding")
 
     return pipe
 
@@ -107,7 +81,7 @@ def _point_to_hit(rank: int, point, retriever: str) -> dict:
         "title": meta.get("title"),
         "page_start": meta.get("page_start"),
         "page_end": meta.get("page_end"),
-        "section_path": meta.get("section_path") or [],
+        "section_paths": meta.get("section_paths") or [],
         "content_type": meta.get("content_type"),
         "source_uri": meta.get("source_uri"),
         "content": payload.get("content") or "",
@@ -116,14 +90,11 @@ def _point_to_hit(rank: int, point, retriever: str) -> dict:
 
 def _selected_methods(
     semantic: bool,
-    bge_lexical: bool,
     bm25: bool,
 ) -> list[str]:
     methods: list[str] = []
     if semantic:
         methods.append(SEMANTIC)
-    if bge_lexical:
-        methods.append(BGE_LEXICAL)
     if bm25:
         methods.append(BM25_LEXICAL)
     return methods
@@ -133,11 +104,11 @@ def search(
     query: str,
     *,
     semantic: bool = True,
-    bge_lexical: bool = True,
     bm25: bool = True,
     rank_fusion: bool = True,
     top_k: int = 10,
     candidate_k: int | None = None,
+    metadata_filter: dict | qdrant_models.Filter | None = None,
     collection: str = DEFAULT_NATIVE_COLLECTION,
     qdrant_url: str = DEFAULT_QDRANT_URL,
     model_path: str | None = None,
@@ -151,34 +122,41 @@ def search(
 
     if mode is not None:
         if mode == "dense":
-            semantic, bge_lexical, bm25, rank_fusion = True, False, False, False
+            semantic, bm25, rank_fusion = True, False, False
         elif mode == "sparse":
-            semantic, bge_lexical, bm25, rank_fusion = False, True, False, False
+            semantic, bm25, rank_fusion = False, True, False
         elif mode == "hybrid":
-            semantic, bge_lexical, bm25, rank_fusion = True, True, False, True
+            semantic, bm25, rank_fusion = True, True, True
         else:
             raise ValueError(f"Unsupported retrieval mode: {mode}")
 
-    methods = _selected_methods(semantic, bge_lexical, bm25)
+    methods = _selected_methods(semantic, bm25)
     if not methods:
         raise ValueError("select at least one retrieval method")
     if rank_fusion and len(methods) < 2:
         raise ValueError("rank_fusion requires at least two retrieval methods")
+
+    query_filter = None
+    if metadata_filter is not None:
+        if isinstance(metadata_filter, qdrant_models.Filter):
+            query_filter = metadata_filter
+        elif isinstance(metadata_filter, dict) and metadata_filter:
+            if not set(metadata_filter) <= {"must", "should", "must_not", "min_should"}:
+                raise ValueError("metadata_filter must use Qdrant filter clauses")
+            query_filter = qdrant_models.Filter.model_validate(metadata_filter)
+        else:
+            raise ValueError("metadata_filter must be a non-empty Qdrant filter object")
+        if not any((query_filter.must, query_filter.should, query_filter.must_not, query_filter.min_should)):
+            raise ValueError("metadata_filter must contain at least one condition")
 
     client = QdrantClient(url=qdrant_url)
     if not client.collection_exists(collection):
         raise ValueError(f"collection does not exist: {collection}")
 
     dense_query: list[float] | None = None
-    sparse_query: qdrant_models.SparseVector | None = None
-    if semantic or bge_lexical:
+    if semantic:
         embedded = _embed_query(query, model_path)
         dense_query = list(embedded["embedding"])
-        sparse = embedded["sparse_embedding"]
-        sparse_query = qdrant_models.SparseVector(
-            indices=list(sparse.indices),
-            values=list(sparse.values),
-        )
 
     bm25_query = None
     if bm25:
@@ -190,7 +168,6 @@ def search(
 
     query_by_method = {
         SEMANTIC: (dense_query, DENSE_VECTORS_NAME),
-        BGE_LEXICAL: (sparse_query, SPARSE_VECTORS_NAME),
         BM25_LEXICAL: (bm25_query, BM25_VECTOR_NAME),
     }
 
@@ -203,6 +180,7 @@ def search(
             qdrant_models.Prefetch(
                 query=query_by_method[method][0],
                 using=query_by_method[method][1],
+                filter=query_filter,
                 limit=effective_candidate_k,
             )
             for method in methods
@@ -236,6 +214,7 @@ def search(
             collection_name=collection,
             query=query_value,
             using=vector_name,
+            query_filter=query_filter,
             limit=top_k,
             with_payload=True,
             with_vectors=False,

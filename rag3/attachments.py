@@ -11,6 +11,8 @@ from email.message import Message
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
+from rag3.constants import MCP_FILE_SUFFIXES
+
 
 class AttachmentError(ValueError):
     pass
@@ -45,8 +47,8 @@ def validate_filename(filename: str) -> str:
             "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
             *(f"LPT{i}" for i in range(1, 10))}:
         raise AttachmentError("filename is reserved by Windows.")
-    if Path(filename).suffix.lower() not in {".pdf", ".doc", ".docx", ".md"}:
-        raise AttachmentError("supported formats: PDF, DOC, DOCX, MD")
+    if Path(filename).suffix.lower() not in MCP_FILE_SUFFIXES:
+        raise AttachmentError("supported formats: PDF, DOC, DOCX, MD, TXT, JSON, JSONL, CSV, TSV")
     return filename
 
 
@@ -84,11 +86,14 @@ def _filename(supplied: str, headers, url: str) -> str:
     if name:
         return validate_filename(name)
     name = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
-    if Path(name).suffix.lower() in {".pdf", ".doc", ".docx", ".md"}:
+    if Path(name).suffix.lower() in MCP_FILE_SUFFIXES:
         return validate_filename(name)
     suffix = {"application/pdf": ".pdf", "application/msword": ".doc",
               "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-              "text/markdown": ".md"}.get(headers.get("Content-Type", "").split(";")[0].strip())
+              "text/markdown": ".md", "text/plain": ".txt",
+              "application/json": ".json", "application/x-ndjson": ".jsonl",
+              "text/csv": ".csv", "text/tab-separated-values": ".tsv"}.get(
+                  headers.get("Content-Type", "").split(";")[0].strip().lower())
     if not suffix:
         raise AttachmentError("The attachment needs its original file_name and extension.")
     return "attachment" + suffix

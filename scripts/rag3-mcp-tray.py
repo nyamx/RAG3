@@ -107,12 +107,6 @@ def _gui_python() -> str:
     return str(windowless if windowless.is_file() else executable)
 
 
-def _console_python() -> str:
-    executable = Path(sys.executable)
-    console = executable.with_name("python.exe")
-    return str(console if console.is_file() else executable)
-
-
 class TrayController(QObject):
     def __init__(self, app: QApplication) -> None:
         super().__init__()
@@ -176,7 +170,7 @@ class TrayController(QObject):
             env["RAG3_MCP_TRANSPORT"] = "streamable-http"
             with LOG.open("a", encoding="utf-8") as log:
                 self.process = subprocess.Popen(
-                    [_console_python(), str(SERVER)], cwd=ROOT, env=env,
+                    [_gui_python(), str(SERVER)], cwd=ROOT, env=env,
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
