@@ -146,3 +146,11 @@ Baseline: `codex/shared-backend`, HEAD before work `e886e04`. Existing untracked
 **PARTIAL, NOT FINAL PASS.** Operational SQLite: `quick_check=ok`, jobs **82**, active **0** at record time. HTTP backend and Qt UI were exercised; installed Codex HTTP MCP plugin `0.1.2` was exercised in a new Codex task. Actual semantic/RRF/nonfused UI↔MCP search parity **7/7**, single GPU BGE load **1**, RRF stable tie-break and 5/5 offline acceptance tests PASS. Live backend was restarted safely (PID `18140` to `22688`) with token rotation; process/DB preservation checked. The exact evidence and unresolved conditions are documented in `artifacts/stage-d-verification-20261024/STAGE_D_ACCEPTANCE_STATUS.md`.
 
 **Do not declare Stage D complete:** remote tunnel external MCP E2E and post-restart reconnect, genuine Windows relogin, full live failure-recovery matrix, precutover performance/resource baseline and deployment cleanup remain unverified. A ChatGPT RAG3 tool response does not alone establish that the response traversed the saved Secure MCP Tunnel.
+
+### Stage D isolated resilience regression (2026-10-24)
+
+- Isolation-only regression: `test-shared-backend-C-isolated.py`, `test-shared-backend-C-hardening.py`, `test-shared-backend-C-winjob.py`, `test-stage-c-search-budget.py`: **4/4 PASS**.
+- Stage C budget test now recognizes the Stage D `ui.hits` field alongside MCP `results`; production search logic was not modified by this test fix.
+- Evidence: `artifacts/stage-d-verification-20261024/STAGE_D_RESILIENCE_BUDGET_CONTRACT_FIX_20261024.json` (locally retained).
+- Operational SQLite `quick_check=ok`, 82 jobs, no active jobs; backend PID unchanged throughout the isolated suite.
+- These are isolated regressions, **not** a full crash/recovery, Windows relogin, remote tunnel E2E, or before/after performance acceptance test. **Stage D remains PARTIAL.**

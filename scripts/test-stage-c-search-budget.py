@@ -142,7 +142,7 @@ class SearchBudgetTests(unittest.TestCase):
                 "rag3.retrieval.search", side_effect=fake_search):
             self.assertEqual(server._ui_command(
                 "search", {"query": "query", "collection": "scratch"}, budget),
-                {"results": []})
+                {"results": [], "ui": {"hits": []}})
         self.assertEqual(gpu.deadline, budget.deadline_monotonic)
 
     def test_http_search_preserves_structured_gpu_error(self):
