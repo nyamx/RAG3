@@ -1,0 +1,35 @@
+{
+  "measured_at_local_date": "2026-10-24",
+  "comparison_type": "post-cutover reconstruction of retained legacy UI worker versus deployed backend",
+  "historical_precutover_measurement": false,
+  "host": "same Windows PC and Qdrant collection",
+  "collection": "rag3_main_20261020",
+  "query": "RAG3 동시성",
+  "top_k": 8,
+  "legacy_path": "one new python.exe scripts/retrieval-worker.py process per request",
+  "current_path": "authenticated loopback POST /api/v1/command on persistent backend PID 14540",
+  "semantic_only": {
+    "legacy_cold_wall_ms": [47400.8],
+    "backend_cold_wall_ms": [32110.0],
+    "backend_warm_wall_ms": [402.1, 303.5, 328.4, 328.5, 280.9],
+    "backend_warm_median_ms": 328.4,
+    "backend_model_load_count_after": 1
+  },
+  "bm25_only": {
+    "legacy_process_per_call_wall_ms": [26702.9, 25149.6, 24677.1, 26341.8, 24694.7],
+    "backend_wall_ms": [242.7, 136.8, 157.9, 148.4, 167.8],
+    "legacy_median_ms": 25149.6,
+    "backend_median_ms": 157.9,
+    "legacy_p95_nearest_rank_ms": 26702.9,
+    "backend_p95_nearest_rank_ms": 242.7,
+    "sample_count_per_path": 5
+  },
+  "limitations": [
+    "The retained legacy worker was executed now; these are not measurements recorded before deployment.",
+    "The retained legacy worker uses current retrieval code; Stage D altered RRF tie handling and nonfused deduplication, but these runs used semantic-only and BM25-only paths.",
+    "Runs were sequential and Qdrant cache state was not controlled or randomized.",
+    "Semantic legacy cold has one sample; p95 is not estimated. BM25 p95 with five samples is only a reference maximum.",
+    "No ingestion throughput, process RSS peak, or process-attributed VRAM peak was measured."
+  ],
+  "data_protection": "read-only searches against an existing collection; no production SQLite or Qdrant writes"
+}
