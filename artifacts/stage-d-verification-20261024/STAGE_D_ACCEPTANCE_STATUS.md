@@ -1,6 +1,6 @@
 # Stage D verified evidence and open acceptance gaps
 
-Recorded: 2026-10-24 13:25:28 KST. Git branch `codex/shared-backend`, HEAD `f23a83d` (working tree may be dirty). This is a **partial Stage D acceptance record, not a Stage D completion certificate**.
+Initial checkpoint recorded: 2026-10-24 13:25:28 KST. Git branch `codex/shared-backend`, HEAD `f23a83d` at that time. This is a **partial Stage D acceptance record, not a Stage D completion certificate**. The initial gaps below are historical; see the closeout update at the end for their current status.
 
 ## Data protection at record time
 - Operational SQLite `PRAGMA quick_check`: `ok`; jobs: **82**; active: **0**. Status counts: `{"CANCELLED": 5, "COMPLETE": 72, "FAILED": 5}`.
@@ -27,3 +27,16 @@ Recorded: 2026-10-24 13:25:28 KST. Git branch `codex/shared-backend`, HEAD `f23a
 5. **Final deployment cleanliness/documentation**: verify no legacy tray/worker/manager entrypoints remain in normal startup, update user-facing docs and produce install/rollback audit and functional commits.
 
 No `Stage D PASS` claim until each required external and operational test is verified or an explicit scoped exception is agreed.
+
+## Closeout update — 2026-10-24
+
+| Criterion | Current observation | Limit |
+| --- | --- | --- |
+| Existing data | Online SQLite snapshot in `artifacts/backups/stage-d-closeout-20261024_145917/` passed integrity; after two gated task restarts, operating DB retained 82 jobs (72 COMPLETE, 5 FAILED, 5 CANCELLED) and quick_check `ok` | Existing Qdrant user collections were read, not mutated for acceptance |
+| Qt UI controls | Isolated real Qt→HTTP backend test passed Submit/Run/Pause/Resume/Cancel/Retry/Hide, source path lookup, collection create/confirmed multi-delete, late write reconciliation, and token rotation read retry | Temporary SQLite, fake Qdrant, injected ingestion work; no production write |
+| Fault recovery | Isolated HTTP backend OS kill, checkpoint/source preservation, Qdrant outage/recovery, manual Resume and injected CUDA failure/BM25 continuity passed | Real Docling/CUDA call interrupted mid-execution was not tested |
+| One backend process | Saved task XML; upgraded registered action to `.venv\Scripts\rag3-pythonw-direct.exe`; manual stop/start produced one backend Python PID directly under Task Scheduler service, cold BGE 0 and after remote semantic search load count 1 | Actual Windows sign-out/sign-in still untested |
+| Remote tunnel | This chat's connected RAG3 app returned a live five-collection list, shared job list, explicit semantic search and ordinary default-collection search (8 hits). Tunnel dispatch log grew for a connected call | Public URL and raw MCP initialization exchange were not separately captured; stateless remote selection requires a configured default or explicit collection |
+| Performance | Existing post-cutover BM25 12-sample median 173.0 ms, p95 22215.7 ms (cold outlier); operating private committed memory snapshot 5391.6 MiB; device-wide VRAM 2292/4096 MiB | Comparable precutover baseline, production throughput, process RSS/VRAM peaks remain unmeasured; no speedup assertion |
+
+Related commits: `21eeb99`, `bda6173`, `b4add1d`, `192d96d`, `51d9818`, `2cc346b`. The exact test scope and limitations are in `RAG3_SHARED_BACKEND_PROGRESS.md`. **Formal status remains PARTIAL** pending a genuine login test and an explicit decision on the irrecoverable precutover measurement criterion.
