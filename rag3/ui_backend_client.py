@@ -18,8 +18,12 @@ from rag3.constants import ROOT
 
 
 class UIBackendClient(QObject):
-    def __init__(self, parent: QObject | None = None, *, port: int | None = None):
+    def __init__(self, parent: QObject | None = None, *, port: int | None = None,
+                 request_timeout_ms: int = 97000):
         super().__init__(parent)
+        if request_timeout_ms <= 0:
+            raise ValueError('request_timeout_ms must be positive')
+        self.request_timeout_ms = request_timeout_ms
         self.port = int(port if port is not None else os.environ.get('RAG3_MCP_PORT', '8000'))
         if not 1 <= self.port <= 65535:
             raise ValueError('RAG3_MCP_PORT must be 1..65535')
@@ -47,7 +51,7 @@ class UIBackendClient(QObject):
             request = QNetworkRequest(self.url)
             request.setRawHeader(b'X-RAG3-Token', token.encode('ascii'))
             request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, 'application/json')
-            request.setTransferTimeout(97000)
+            request.setTransferTimeout(self.request_timeout_ms)
             reply = self.network.post(request, body)
             self._pending.add(reply)
 
