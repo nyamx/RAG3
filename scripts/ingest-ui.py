@@ -5,7 +5,6 @@ import json
 import os
 import re
 import sys
-import subprocess
 from enum import Enum
 from pathlib import Path
 
@@ -13,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QProcess, QTimer, Qt, QUrl
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,13 +44,16 @@ from PySide6.QtWidgets import (
 )
 
 from rag3.source_identity import sha256_file
-from rag3 import ingestion_jobs as job_db
-from rag3.ingestion_jobs import (change_versions, content_scope, ensure_change_signal,
-                                 list_jobs)
-from rag3.ingestion_manager import client as manager_client
+from rag3.ui_backend_client import UIBackendClient
+from rag3.constants import DATA_ROOT
 
 DEFAULT_NATIVE_COLLECTION = "rag3_haystack"
-UI_STATE_PATH = ROOT / "data" / "ui-state.json"
+UI_STATE_PATH = DATA_ROOT / "ui-state.json"
+CHANGE_SIGNAL_PATH = DATA_ROOT / "ingestion_jobs.signal"
+
+
+def content_scope(collection: str) -> str:
+    return "contents:" + collection
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".doc", ".docx", ".pptx", ".xlsx", ".html", ".htm", ".md", ".txt",
@@ -111,6 +113,14 @@ class IngestionWindow(QMainWindow):
         self.setWindowTitle("RAG3 Haystack")
         self.resize(1280, 820)
 
+        self.backend = UIBackendClient(self)
+        self._latest_versions: dict[str, int] = {}
+        self._jobs_seen_version = -1
+        self._collections_seen_version = -1
+        self._jobs_loading = False
+        self._revisions_loading = False
+        self._jobs_again = False
+        self._job_write_pending: set[str] = set()
         self.jobs: list[dict] = []
         self._last_complete: set[str] = set()
         self._last_collection_check = 0
@@ -123,15 +133,10 @@ class IngestionWindow(QMainWindow):
         self._collections_loading_version = 0
         self._collection_background = False
 
-        self.retrieval_process: QProcess | None = None
-        self.retrieval_stdout_buffer = ""
-
-        # A single worker serializes collection list/create/content requests.
-        # Keeping this boundary here prevents the UI from owning document-store logic.
-        self.collection_process: QProcess | None = None
-        self.collection_stdout_buffer = ""
-        self.collection_stderr_buffer = ""
+        self._retrieval_pending = False
+        self._collection_pending = False
         self.collection_action: str | None = None
+        self._collection_background = False
         self.ui_state = UiState.READY
 
         toolbar = QToolBar("Documents")
@@ -300,9 +305,10 @@ class IngestionWindow(QMainWindow):
         # Changing collections invalidates rows from the previous selection.
         self.collection.currentTextChanged.connect(self.collection_changed)
 
-        signal_path = ensure_change_signal()
+        # File notifications wake a version read; only the backend reads SQLite.
         self.change_watcher = QFileSystemWatcher(self)
-        self.change_watcher.addPath(str(signal_path.parent))
+        if CHANGE_SIGNAL_PATH.parent.is_dir():
+            self.change_watcher.addPath(str(CHANGE_SIGNAL_PATH.parent))
         self._watch_change_files()
         self.change_watcher.fileChanged.connect(self._change_signal)
         self.change_watcher.directoryChanged.connect(self._change_directory)
@@ -310,15 +316,14 @@ class IngestionWindow(QMainWindow):
         self.change_debounce.setSingleShot(True)
         self.change_debounce.setInterval(150)
         self.change_debounce.timeout.connect(self._check_revisions)
-        initial = change_versions('jobs', 'collections')
-        self._jobs_seen_version = initial['jobs']
-        self._collections_seen_version = initial['collections']
+        self.fallback_timer = QTimer(self)
+        self.fallback_timer.setInterval(15000)
+        self.fallback_timer.timeout.connect(self._check_revisions)
+        self.fallback_timer.start()
         self.collection.focus_lost = self._collection_focus_lost
         self.load_ui_state()
-        self.load_jobs()
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage('Connecting to shared RAG3 backend…')
         self.update_controls()
-        self.refresh_collections()
         self.collection.refresh_popup = self._check_revisions
         self.main_tabs.currentChanged.connect(self.tab_changed)
         QTimer.singleShot(0, self._check_revisions)
@@ -332,17 +337,11 @@ class IngestionWindow(QMainWindow):
             self.change_debounce.start()
 
     def _watch_change_files(self) -> bool:
-        """Watch both the RAG3 signal and SQLite writes from older processes."""
-        paths = (ensure_change_signal(), job_db.DB_PATH,
-                 Path(str(job_db.DB_PATH) + '-wal'))
         watched = set(self.change_watcher.files())
-        added = False
-        for path in paths:
-            value = str(path)
-            if path.exists() and value not in watched:
-                self.change_watcher.addPath(value)
-                added = True
-        return added
+        if CHANGE_SIGNAL_PATH.is_file() and str(CHANGE_SIGNAL_PATH) not in watched:
+            self.change_watcher.addPath(str(CHANGE_SIGNAL_PATH))
+            return True
+        return False
 
     def _collection_focus_lost(self) -> None:
         if self._pending_collection_names is not None:
@@ -357,26 +356,34 @@ class IngestionWindow(QMainWindow):
                 or self.collection.view().isVisible())
 
     def _check_revisions(self) -> None:
-        collection = self.current_collection()
-        scopes = ['jobs', 'collections']
-        if collection:
-            scopes.append(content_scope(collection))
-        try:
-            versions = change_versions(*scopes)
-        except Exception as exc:
-            self.statusBar().showMessage(f"Change notification unavailable: {exc}")
+        if self._revisions_loading:
             return
-        if versions['jobs'] != self._jobs_seen_version and self.load_jobs():
-            self._jobs_seen_version = versions['jobs']
-        if (versions['collections'] != self._collections_seen_version
-                and self.ui_state == UiState.READY and not self._collection_is_editing()):
-            self.refresh_collections(background=True)
-        if (collection and self.collection.findText(collection) >= 0
-                and self.ui_state == UiState.READY
-                and self.main_tabs.currentWidget() is self.contents_tab
-                and (self._displayed_contents_collection != collection
-                     or versions[content_scope(collection)] != self._contents_seen.get(collection))):
-            self.refresh_contents(background=True)
+        self._revisions_loading = True
+        requested_collection = self.current_collection()
+
+        def finished(result, error):
+            self._revisions_loading = False
+            if error:
+                self.statusBar().showMessage(f'Backend unavailable: {error}')
+                return
+            versions = (result or {}).get('versions') or {}
+            self._latest_versions.update(versions)
+            if versions.get('jobs', 0) != self._jobs_seen_version:
+                self._jobs_seen_version = versions.get('jobs', 0)
+                self.load_jobs()
+            if (versions.get('collections', 0) != self._collections_seen_version
+                    and self.ui_state == UiState.READY and not self._collection_is_editing()):
+                self.refresh_collections(background=True)
+            current = self.current_collection()
+            if (current == requested_collection and current
+                    and self.collection.findText(current) >= 0
+                    and self.ui_state == UiState.READY
+                    and self.main_tabs.currentWidget() is self.contents_tab
+                    and (self._displayed_contents_collection != current
+                         or versions.get(content_scope(current), 0) != self._contents_seen.get(current))):
+                self.refresh_contents(background=True)
+
+        self.backend.command('ui.revisions', {'collection': requested_collection}, finished)
 
     def event(self, event):
         result = super().event(event)
@@ -392,35 +399,57 @@ class IngestionWindow(QMainWindow):
         return rows[0] if rows else None
 
     def _manager_action(self, operation: str, job_id: str) -> bool:
-        try:
-            manager_client('action', operation=operation, job_id=job_id)
-            self.load_jobs()
-            return True
-        except Exception as exc:
-            self.errors.appendPlainText(f"Manager {operation} failed: {exc}")
-            self.statusBar().showMessage(f"Ingestion manager error: {exc}")
+        if job_id in self._job_write_pending:
             return False
+        self._job_write_pending.add(job_id)
+
+        def finished(result, error):
+            self._job_write_pending.discard(job_id)
+            if error:
+                self.errors.appendPlainText(f'{operation} uncertain/failed: {error}')
+                self.statusBar().showMessage(error)
+            self.load_jobs()
+            self._check_revisions()
+
+        return self.backend.command('jobs.action', {'job_id': job_id, 'operation': operation},
+                                    finished, read_only=False)
 
     def save_jobs(self) -> None:
-        """Ingestion jobs belong exclusively to the shared SQLite DB."""
+        """Job storage is exclusively owned by the backend."""
         return
 
     def load_jobs(self) -> bool:
-        """Load shared jobs only after a revision change or an explicit action."""
-        try:
-            data = []
-            offset = 0
-            while True:
-                page = list_jobs(limit=200,offset=offset,include_hidden=False)
-                data.extend(page['jobs'])
-                offset += len(page['jobs'])
-                if offset >= page['total'] or not page['jobs']:
-                    break
-        except Exception as exc:
-            message = f"Ingestion DB unavailable: {exc}"
-            if self.statusBar().currentMessage() != message:
-                self.statusBar().showMessage(message)
+        if self._jobs_loading:
+            self._jobs_again = True
             return False
+        self._jobs_loading = True
+        data: list[dict] = []
+
+        def load_page(offset: int):
+            def finished(result, error):
+                if error:
+                    self._jobs_loading = False
+                    self.statusBar().showMessage(f'Jobs unavailable: {error}')
+                    return
+                page = (result or {}).get('jobs') or []
+                data.extend(page)
+                total = (result or {}).get('total', len(data))
+                if page and len(data) < total:
+                    load_page(len(data))
+                    return
+                self._jobs_loading = False
+                self._apply_jobs(data)
+                if self._jobs_again:
+                    self._jobs_again = False
+                    QTimer.singleShot(0, self.load_jobs)
+
+            self.backend.command('jobs.list', {'limit': 200, 'offset': offset,
+                                               'include_hidden': False}, finished)
+
+        load_page(0)
+        return True
+
+    def _apply_jobs(self, data: list[dict]) -> None:
         view = tuple((j['job_id'], j['origin'], j['collection'], j['filename'],
                       j['stage'], j['status'], j.get('source_sha256')) for j in data)
         if view == self._job_view:
@@ -434,7 +463,7 @@ class IngestionWindow(QMainWindow):
         current_ids = [self.table.item(i, COL_ID).text() for i in range(self.table.rowCount())]
         target_ids = [j['job_id'] for j in data]
         structural_change = current_ids != target_ids
-        # SQLite list outputs intentionally omit private source paths. UI can query locally for Open Source.
+        # Job list intentionally omits private source paths.
         self.table.blockSignals(True)
         try:
             for i in range(len(current_ids) - 1, -1, -1):
@@ -474,7 +503,7 @@ class IngestionWindow(QMainWindow):
         if newly_completed and self.main_tabs.currentWidget() is self.contents_tab:
             if any(j['job_id'] in newly_completed and j['collection'] == self.current_collection() for j in data):
                 self.refresh_contents(background=True)
-        return True
+
 
     def set_ui_state(self, state: UiState) -> None:
         """Set the global UI operation state and re-apply the control policy."""
@@ -529,17 +558,28 @@ class IngestionWindow(QMainWindow):
             self._set_enabled(self.buttons[key], allow)
 
     def add_path(self, path: str) -> None:
-        p=Path(path).expanduser().resolve()
-        if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTENSIONS:return
-        if not self.current_collection():
-            QMessageBox.warning(self,'Create collection','Create and select a Qdrant collection before ingestion.')
+        p = Path(path).expanduser().resolve()
+        if not p.is_file() or p.suffix.lower() not in SUPPORTED_EXTENSIONS:
             return
-        try:
-            manager_client('submit',origin='UI',collection=self.current_collection(),path=str(p),requested=False)
+        collection = self.current_collection()
+        if not collection:
+            QMessageBox.warning(self, 'Create collection', 'Create and select a Qdrant collection before ingestion.')
+            return
+        # No automatic write retry, including on a network timeout.
+        key = str(p)
+        if key in self._job_write_pending:
+            return
+        self._job_write_pending.add(key)
+
+        def finished(_result, error):
+            self._job_write_pending.discard(key)
+            if error:
+                self.errors.appendPlainText(f'Queue result unknown/failed for {p.name}: {error}')
+                self.statusBar().showMessage(error)
             self.load_jobs()
-        except Exception as exc:
-            self.errors.appendPlainText(f'Cannot queue {p.name}: {exc}')
-            self.statusBar().showMessage(f'Ingestion manager error: {exc}')
+
+        self.backend.command('jobs.submit', {'collection': collection, 'path': key},
+                             finished, read_only=False)
 
     def add_files(self) -> None:
         pattern=' '.join(f'*{x}' for x in sorted(SUPPORTED_EXTENSIONS))
@@ -598,20 +638,26 @@ class IngestionWindow(QMainWindow):
         row=self.selected_row()
         if row is not None:self._manager_action('hide',self.jobs[row]['job_id'])
 
-    def _local_source(self, job_id: str) -> str:
-        from rag3.ingestion_jobs import one
-        return one(job_id,private=True).get('source') or ''
-
     def open_source(self) -> None:
-        row=self.selected_row()
-        if row is not None:
-            path=self._local_source(self.jobs[row]['job_id'])
-            if path: QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        row = self.selected_row()
+        if row is None:
+            return
+        job_id = self.jobs[row]['job_id']
+
+        def finished(result, error):
+            if error:
+                self.statusBar().showMessage(f'Open Source unavailable: {error}')
+                return
+            path = (result or {}).get('source') or ''
+            if path:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+        self.backend.command('jobs.local_source', {'job_id': job_id}, finished)
 
     def open_artifacts(self) -> None:
         row=self.selected_row()
         if row is not None and self.jobs[row].get('source_sha256'):
-            folder=ROOT/'data'/'sources'/self.jobs[row]['source_sha256']
+            folder=DATA_ROOT/'sources'/self.jobs[row]['source_sha256']
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def periodic_collections(self) -> None:
@@ -632,59 +678,38 @@ class IngestionWindow(QMainWindow):
         bm25_settings: tuple[float, float, float] | None = None,
         background: bool = False,
     ) -> bool:
-        if (
-            self.collection_process
-            and self.collection_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self._collection_pending:
             if not background:
-                self.statusBar().showMessage(
-                    "A collection operation is already running. Please wait."
-                )
+                self.statusBar().showMessage('A collection operation is already running.')
             return False
-
-        busy_message = {
-            "list": "Loading collections…",
-            "create": "Creating collection…",
-            "delete_many": "Deleting collections…",
-            "contents": "Loading collection contents…",
-        }.get(action, "Working with collections…")
-
+        messages = {'list': 'Loading collections…', 'create': 'Creating collection…',
+                    'delete_many': 'Deleting collections…', 'contents': 'Loading contents…'}
         self.collection_action = action
         self._collection_background = background
-        self.collection_stdout_buffer = ""
-        self.collection_stderr_buffer = ""
         if not background:
             self.set_ui_state(UiState.COLLECTION_BUSY)
-            self.statusBar().showMessage(busy_message)
-
-        self.collection_process = QProcess(self)
-        self.collection_process.setProgram(str(ROOT / ".venv" / "Scripts" / "python.exe"))
-        args = [str(ROOT / "scripts" / "collection-worker.py"), "--action", action]
+            self.statusBar().showMessage(messages.get(action, 'Working with collections…'))
+        params: dict = {}
         if collection:
-            args += ["--collection", collection]
+            params['collection'] = collection
         if collections:
-            args += ["--collections-json", json.dumps(collections, ensure_ascii=False)]
+            params['collections'] = list(collections)
+            params['confirm_collections'] = list(collections)
         if bm25_settings is not None:
-            bm25_k, bm25_b, bm25_avg_len = bm25_settings
-            args += [
-                "--bm25-k", str(bm25_k),
-                "--bm25-b", str(bm25_b),
-                "--bm25-avg-len", str(bm25_avg_len),
-            ]
-        self.collection_process.setArguments(args)
-        self.collection_process.setWorkingDirectory(str(ROOT))
-        self.collection_process.readyReadStandardOutput.connect(self.read_collection_stdout)
-        self.collection_process.readyReadStandardError.connect(self.read_collection_stderr)
-        self.collection_process.finished.connect(self.collection_finished)
-        self.collection_process.start()
-        return True
+            params.update(zip(('bm25_k', 'bm25_b', 'bm25_avg_len'), bm25_settings))
+        # Stamp response versions and mark in-flight *before* dispatch: the
+        # client can fail synchronously if the token/backend is unavailable.
+        if action == 'list':
+            self._collections_loading_version = self._latest_versions.get('collections', 0)
+        elif action == 'contents' and collection:
+            self._contents_loading_version = self._latest_versions.get(content_scope(collection), 0)
+        self._collection_pending = True
+        return self.backend.command('collections.' + action, params,
+                                    lambda result, error: self.collection_finished(result, error),
+                                    read_only=action in {'list', 'contents'})
 
     def refresh_collections(self, *, background: bool = False) -> bool:
-        version = change_versions('collections')['collections']
-        started = self._start_collection_worker("list", background=background)
-        if started:
-            self._collections_loading_version = version
-        return started
+        return self._start_collection_worker('list', background=background)
 
     def create_collection(self) -> None:
         dialog = QDialog(self)
@@ -832,11 +857,7 @@ class IngestionWindow(QMainWindow):
         collection = self.current_collection()
         if not collection:
             return False
-        version = change_versions(content_scope(collection))[content_scope(collection)]
-        started = self._start_collection_worker("contents", collection, background=background)
-        if started:
-            self._contents_loading_version = version
-        return started
+        return self._start_collection_worker("contents", collection, background=background)
 
     def _render_collection_contents(self, payload: dict) -> None:
         """Apply only changed cells from the document-level worker output."""
@@ -909,71 +930,25 @@ class IngestionWindow(QMainWindow):
             self.collection_changed(self.current_collection())
         return True
 
-    def read_collection_stdout(self) -> None:
-        if not self.collection_process:
-            return
-        self.collection_stdout_buffer += bytes(
-            self.collection_process.readAllStandardOutput()
-        ).decode("utf-8", errors="replace")
-
-    def read_collection_stderr(self) -> None:
-        if not self.collection_process:
-            return
-        text = bytes(
-            self.collection_process.readAllStandardError()
-        ).decode("utf-8", errors="replace")
-        if text:
-            self.collection_stderr_buffer += text
-            if not self._collection_background:
-                self.statusBar().showMessage(text.strip()[-300:])
-
-    def collection_finished(self, exit_code: int, _exit_status) -> None:
-        text = self.collection_stdout_buffer.strip()
-        error_text = self.collection_stderr_buffer.strip()
+    def collection_finished(self, payload: dict | None, error: str | None) -> None:
         action = self.collection_action
         background = self._collection_background
-        self.collection_stdout_buffer = ""
-        self.collection_stderr_buffer = ""
-        self.collection_process = None
+        self._collection_pending = False
         self.collection_action = None
         self._collection_background = False
-
-        if exit_code != 0:
-            message = "Qdrant collection operation failed."
-            try:
-                payload = json.loads(text.splitlines()[-1]) if text else {}
-                detail = str(payload.get("error") or "").strip()
-            except Exception:
-                detail = ""
-            if not detail and error_text:
-                detail = error_text.splitlines()[-1].strip()
-            if detail:
-                message = f"{message} {detail}"
+        if error:
+            message = f'Collection {action} failed or unconfirmed: {error}'
             if not background:
                 self.set_ui_state(UiState.READY)
-            if self.statusBar().currentMessage() != message:
-                self.statusBar().showMessage(message)
-            if action == "delete_many":
-                QMessageBox.critical(self, "Delete Collections Failed", message)
-            if action == "contents":
-                message = "Failed to load collection contents."
-                if self.contents_status.text() != message:
-                    self.contents_status.setText(message)
+            self.statusBar().showMessage(message)
+            if action == 'delete_many':
+                QMessageBox.critical(self, 'Delete Collections', message)
+            elif action == 'contents':
+                self.contents_status.setText(message)
+            # For timed-out writes, re-query state rather than repeating mutation.
+            QTimer.singleShot(0, self._check_revisions)
             return
-
-        try:
-            payload = json.loads(text.splitlines()[-1]) if text else {}
-        except Exception:
-            if not background:
-                self.set_ui_state(UiState.READY)
-            message = "Invalid collection worker response."
-            if self.statusBar().currentMessage() != message:
-                self.statusBar().showMessage(message)
-            if action == "contents":
-                message = "Invalid collection contents response."
-                if self.contents_status.text() != message:
-                    self.contents_status.setText(message)
-            return
+        payload = payload or {}
 
         if action == "list":
             names = payload.get("collections") or []
@@ -989,12 +964,14 @@ class IngestionWindow(QMainWindow):
                     self.statusBar().showMessage(f"Loaded {len(names)} Qdrant collections.")
 
         elif action == "create":
+            self.set_ui_state(UiState.READY)
             name = str(payload.get("collection") or self.current_collection())
             self.collection.setText(name)
             self.statusBar().showMessage(f"Collection ready: {name}")
             self.refresh_collections()
 
         elif action == "delete_many":
+            self.set_ui_state(UiState.READY)
             deleted = payload.get("deleted") or []
             deleted = deleted if isinstance(deleted, list) else []
             deleted_set = set(deleted)
@@ -1032,97 +1009,40 @@ class IngestionWindow(QMainWindow):
             QTimer.singleShot(0, self._check_revisions)
 
     def run_retrieval(self) -> None:
-        if self.ui_state != UiState.READY:
-            return
-        if self.retrieval_process and self.retrieval_process.state() != QProcess.ProcessState.NotRunning:
+        if self.ui_state != UiState.READY or self._retrieval_pending:
             return
         query = self.query.text().strip()
         if not query:
-            self.retrieval_status.setText("Enter a query.")
+            self.retrieval_status.setText('Enter a query.')
             return
-
+        semantic = self.retrieval_semantic.isChecked()
+        bm25 = self.retrieval_bm25.isChecked()
+        if not (semantic or bm25):
+            self.retrieval_status.setText('Select at least one retrieval method.')
+            return
         self.retrieval_results.clear()
-        self.retrieval_status.setText("Searching...")
-        self.retrieval_stdout_buffer = ""
+        self.retrieval_status.setText('Searching…')
+        self._retrieval_pending = True
         self.set_ui_state(UiState.RETRIEVAL_RUNNING)
+        options = {'semantic': semantic, 'bm25': bm25,
+                   'rank_fusion': bool(semantic and bm25 and self.retrieval_rank_fusion.isChecked()),
+                   'top_k': self.retrieval_top_k.value()}
+        collection = self.current_collection()
 
-        methods = []
-        if self.retrieval_semantic.isChecked():
-            methods.append("--semantic")
-        if self.retrieval_bm25.isChecked():
-            methods.append("--bm25")
-        if not methods:
-            self.retrieval_status.setText("Select at least one retrieval method.")
+        def finished(result, error):
+            self._retrieval_pending = False
             self.set_ui_state(UiState.READY)
-            return
+            if error:
+                self.retrieval_status.setText(f'Search failed: {error}')
+                return
+            self.retrieval_finished(result or {})
 
-        use_fusion = self.retrieval_rank_fusion.isChecked() and len(methods) >= 2
+        self.backend.command('search', {'query': query, 'collection': collection,
+                                        'options': options}, finished)
 
-        self.retrieval_process = QProcess(self)
-        self.retrieval_process.setProgram(str(ROOT / ".venv" / "Scripts" / "python.exe"))
-        args = [
-            str(ROOT / "scripts" / "retrieval-worker.py"),
-            "--query", query,
-            "--collection", self.current_collection(),
-            "--top-k", str(self.retrieval_top_k.value()),
-            *methods,
-        ]
-        if use_fusion:
-            args.append("--rank-fusion")
-        self.retrieval_process.setArguments(args)
-        self.retrieval_process.setWorkingDirectory(str(ROOT))
-        self.retrieval_process.readyReadStandardOutput.connect(self.read_retrieval_stdout)
-        self.retrieval_process.readyReadStandardError.connect(self.read_retrieval_stderr)
-        self.retrieval_process.errorOccurred.connect(self.retrieval_error)
-        self.retrieval_process.finished.connect(self.retrieval_finished)
-        self.retrieval_process.start()
-
-    def retrieval_error(self, error: QProcess.ProcessError) -> None:
-        if error != QProcess.ProcessError.FailedToStart or self.retrieval_process is None:
-            return
-        detail = self.retrieval_process.errorString()
-        self.retrieval_process = None
-        self.retrieval_stdout_buffer = ""
-        self.retrieval_status.setText(f"Search could not start: {detail}")
-        self.set_ui_state(UiState.READY)
-
-    def read_retrieval_stdout(self) -> None:
-        if not self.retrieval_process:
-            return
-        self.retrieval_stdout_buffer += bytes(
-            self.retrieval_process.readAllStandardOutput()
-        ).decode("utf-8", errors="replace")
-
-    def read_retrieval_stderr(self) -> None:
-        if not self.retrieval_process:
-            return
-        text = bytes(self.retrieval_process.readAllStandardError()).decode("utf-8", errors="replace").strip()
-        if text:
-            self.retrieval_results.appendPlainText(text[-8000:])
-
-    def retrieval_finished(self, exit_code: int, _exit_status) -> None:
-        if self.retrieval_process is None:
-            return
-        text = self.retrieval_stdout_buffer.strip()
-        self.retrieval_stdout_buffer = ""
-        self.retrieval_process = None
-        self.set_ui_state(UiState.READY)
-
-        if exit_code != 0:
-            try:
-                failure = json.loads(text.splitlines()[-1])
-                detail = str(failure.get("message") or "").strip()
-            except (ValueError, IndexError, AttributeError):
-                detail = ""
-            self.retrieval_status.setText(f"Search failed: {detail}" if detail else "Search failed.")
-            return
-        try:
-            payload = json.loads(text.splitlines()[-1])
-            result = payload.get("result") or {}
-            hits = result.get("hits") or []
-        except Exception as exc:
-            self.retrieval_status.setText(f"Invalid search response: {exc}")
-            return
+    def retrieval_finished(self, payload: dict) -> None:
+        result = payload.get('ui') or {}
+        hits = result.get('hits') or []
 
         methods = result.get("methods") or []
         fusion_label = "RRF" if result.get("rank_fusion") else "independent"
@@ -1198,157 +1118,26 @@ class IngestionWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.change_debounce.stop()
-        # These are UI-owned collection/retrieval helpers, not ingestion workers.
-        # The detached ingestion manager must outlive this window.
-        for attr in ('collection_process', 'retrieval_process'):
-            process = getattr(self, attr, None)
-            if process is None:
-                continue
-            if process.state() != QProcess.ProcessState.NotRunning:
-                process.terminate()
-                if not process.waitForFinished(1500):
-                    process.kill()
-                    process.waitForFinished(3000)
+        self.fallback_timer.stop()
+        # Closing the UI does not stop or restart the shared backend.
         self.save_ui_state()
         super().closeEvent(event)
 
 
-def ensure_infrastructure() -> tuple[bool, str]:
-    script = ROOT / "scripts" / "ensure-infra.ps1"
-    if not script.is_file():
-        return False, f"Missing infrastructure script: {script}"
-
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    try:
-        proc = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script),
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-            creationflags=creationflags,
-        )
-    except Exception as exc:
-        return False, f"Failed to start Qdrant infrastructure: {exc}"
-
-    output = "\n".join(x for x in [proc.stdout.strip(), proc.stderr.strip()] if x)
-    if proc.returncode != 0:
-        return False, output or f"ensure-infra.ps1 failed with exit code {proc.returncode}"
-    return True, output or "Qdrant infrastructure ready."
-
-
-def launch_mcp_tray() -> tuple[bool, str]:
-    """Start the independent tray controller; an existing controller exits its duplicate."""
-    if os.name != "nt":
-        return False, "The MCP tray controller requires Windows."
-    script = ROOT / "scripts" / "rag3-mcp-tray.py"
-    if not script.is_file():
-        return False, f"Missing MCP tray controller: {script}"
-    executable = Path(sys.executable)
-    windowless = executable.with_name("pythonw.exe")
-    if windowless.is_file():
-        executable = windowless
-    log_path = ROOT / "data" / "logs" / "mcp-tray.log"
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as log:
-            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-            # A launcher may itself be inside a Windows Job Object. Break away
-            # when permitted so closing that launcher cannot stop the tray.
-            try:
-                subprocess.Popen(
-                    [str(executable), str(script)], cwd=str(ROOT),
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=flags | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0),
-                )
-            except OSError:
-                subprocess.Popen(
-                    [str(executable), str(script)], cwd=str(ROOT),
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=flags,
-                )
-    except Exception as exc:
-        return False, f"MCP tray controller could not start: {exc}"
-    return True, "MCP background controller is starting in the system tray."
-
-
-def launch_codex_plugin_check() -> tuple[bool, str]:
-    """Check/install the local Codex plugin without delaying UI startup."""
-    if os.name != "nt":
-        return False, "Codex plugin auto-registration requires Windows."
-    script = ROOT / "scripts" / "ensure-rag3-codex-plugin.py"
-    if not script.is_file():
-        return False, f"Missing Codex plugin registration helper: {script}"
-    executable = Path(sys.executable)
-    windowless = executable.with_name("pythonw.exe")
-    if windowless.is_file():
-        executable = windowless
-    log_path = ROOT / "data" / "logs" / "codex-plugin-install.log"
-    status_path = ROOT / "data" / "logs" / "codex-plugin-status.json"
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as log:
-            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-            command = [str(executable), str(script), "--status-file", str(status_path)]
-            try:
-                subprocess.Popen(
-                    command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
-                    stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=flags | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0),
-                )
-            except OSError:
-                subprocess.Popen(
-                    command, cwd=str(ROOT), stdin=subprocess.DEVNULL,
-                    stdout=log, stderr=subprocess.STDOUT, creationflags=flags,
-                )
-    except Exception as exc:
-        return False, f"Codex plugin check could not start: {exc}"
-    return True, "Codex plugin registration check started."
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--smoke-test", action="store_true")
+    ap.add_argument('--smoke-test', action='store_true')
     args, _ = ap.parse_known_args()
     if args.smoke_test:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     app = QApplication(sys.argv[:1])
-
-    infra_ok, infra_message = ensure_infrastructure()
-    if not infra_ok:
-        QMessageBox.critical(
-            None,
-            "RAG3 startup failed",
-            "Qdrant infrastructure could not be started.\n\n" + infra_message,
-        )
-        raise SystemExit(1)
     win = IngestionWindow()
-    win.statusBar().showMessage("Qdrant ready")
     if args.smoke_test:
-        print("PYSIDE6_UI_SMOKE_OK")
+        print('PYSIDE6_UI_SMOKE_OK')
         return
-    tray_ok, tray_message = launch_mcp_tray()
-    if not tray_ok:
-        QMessageBox.warning(win, "RAG3 MCP background", tray_message)
-    else:
-        win.statusBar().showMessage("Qdrant ready; MCP background starting")
-    plugin_ok, plugin_message = launch_codex_plugin_check()
-    if not plugin_ok and os.name == "nt":
-        win.statusBar().showMessage(plugin_message)
     win.show()
     raise SystemExit(app.exec())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
