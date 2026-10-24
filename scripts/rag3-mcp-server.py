@@ -42,6 +42,7 @@ from rag3.sources import SourceError, render_page, source_metadata, source_part
 QDRANT_URL = os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL)
 _SESSION_COLLECTIONS = SessionCollections(os.environ.get("RAG3_COLLECTION", DEFAULT_NATIVE_COLLECTION))
 _CALL_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("rag3_session", default="direct-call")
+_SESSIONLESS_HTTP = "mcp:http-without-session"
 _CALL_COLLECTION: contextvars.ContextVar[str | None] = contextvars.ContextVar("rag3_collection", default=None)
 _CALL_BUDGET: contextvars.ContextVar[SearchCallBudget | None] = contextvars.ContextVar("rag3_call_budget", default=None)
 JOBS = JobManager(qdrant_url=QDRANT_URL)
@@ -56,6 +57,7 @@ MAX_FETCH_CHARS = 12_000
 REF_PREFIX = "r3v1"
 
 SERVER_INSTRUCTIONS = """Use rag3_list_collections and rag3_select_collection to choose a RAG3 collection.
+If list_collections reports selection_persistent=false, this connector has no stable MCP session. Pass collection explicitly to search/fetch and other collection-dependent calls; select_collection cannot persist.
 Use rag3_list_ingestion_jobs to recover job IDs after reconnecting; jobs from UI and MCP share the same queue.
 Use rag3_search for retrieval and rag3_fetch to read source chunks.
 Use rag3_search_flexible when a request needs metadata conditions or a per-request collection.
@@ -556,14 +558,29 @@ def _collection_name(name: str) -> str:
 
 def _selected_collection(*, required: bool = True, available: list[str] | None = None) -> str | None:
     existing = available if available is not None else list_collections(url=QDRANT_URL)
-    selected = _SESSION_COLLECTIONS.get(_CALL_SESSION.get(), existing)
+    if _CALL_SESSION.get() == _SESSIONLESS_HTTP:
+        # The tunnel may omit a stable MCP session ID. Only a configured
+        # collection or an unambiguous sole collection is safe as a default;
+        # never store a mutable selection under a process-wide fallback key.
+        preferred = _SESSION_COLLECTIONS.preferred
+        selected = (preferred if preferred in existing else
+                    existing[0] if len(existing) == 1 else None)
+    else:
+        selected = _SESSION_COLLECTIONS.get(_CALL_SESSION.get(), existing)
     if required and selected is None:
-        raise ToolFailure("COLLECTION_NOT_SELECTED", "No valid collection selected. Use rag3_select_collection.", False)
+        action = ("Pass collection explicitly to this call." if _CALL_SESSION.get() == _SESSIONLESS_HTTP
+                  else "Use rag3_select_collection.")
+        raise ToolFailure("COLLECTION_NOT_SELECTED", "No valid collection selected. " + action, False)
     return selected
 
 
 def _session_key(ctx: Context) -> str:
-    return session_identifier(ctx)
+    try:
+        return session_identifier(ctx)
+    except RuntimeError as exc:
+        if str(exc) != "Stateful HTTP MCP session ID is unavailable":
+            raise
+        return _SESSIONLESS_HTTP
 
 
 SOURCE_VIEW_URI = "ui://rag3/original-source-v9.html"
@@ -722,22 +739,29 @@ async def rag3_search_flexible(
 async def rag3_list_collections(ctx: Context) -> Annotated[CallToolResult, dict[str, Any]]:
     def run() -> dict:
         available = list_collections(url=QDRANT_URL)
-        return {"collections": available,
-                "selected": _selected_collection(required=False, available=available)}
+        result = {"collections": available,
+                  "selected": _selected_collection(required=False, available=available)}
+        if _CALL_SESSION.get() == _SESSIONLESS_HTTP:
+            result["selection_persistent"] = False
+        return result
     return await _run_tool(run, session_key=_session_key(ctx))
 
 
 @mcp.tool(name="rag3_select_collection", title="RAG3 컬렉션 선택",
-          description="Select the collection for subsequent search and fetch calls on this server process.",
+          description="Select the collection for subsequent search and fetch calls in this MCP session.",
           annotations=WRITE, structured_output=True)
 async def rag3_select_collection(collection: str, ctx: Context) -> Annotated[CallToolResult, dict[str, Any]]:
+    session_key = _session_key(ctx)
+    if session_key == _SESSIONLESS_HTTP:
+        return _error("SESSION_REQUIRED", "This MCP connection has no persistent session. "
+                      "Pass collection explicitly to search, fetch, and other collection-dependent calls.")
     def run() -> dict:
         name = _collection_name(collection)
         if name not in list_collections(url=QDRANT_URL):
             raise ValueError(f"collection does not exist: {name}")
         _SESSION_COLLECTIONS.select(_CALL_SESSION.get(), name)
         return {"selected": name}
-    return await _run_tool(run, session_key=_session_key(ctx))
+    return await _run_tool(run, session_key=session_key)
 
 
 @mcp.tool(name="rag3_create_collection", title="RAG3 컬렉션 생성",
