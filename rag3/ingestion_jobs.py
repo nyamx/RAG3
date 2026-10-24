@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import re
 import sqlite3
 import time
@@ -45,15 +47,20 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-@contextmanager
-def connect():
-    """Transaction-scoped SQLite connection which always closes its file handles."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(DB_PATH), timeout=20)
+_SCHEMA_LOCK = threading.RLock()
+_SCHEMA_READY = set()  # (resolved path, filesystem identity, process id)
+
+
+def _file_identity(path):
+    stat = path.stat()
+    return (str(path.resolve()), stat.st_dev, stat.st_ino, stat.st_size if stat.st_size == 0 else None, os.getpid())
+
+
+def _initialize_schema(db):
+    # WAL is persistent, but PRAGMA journal_mode is not valid inside a tx.
+    db.execute('PRAGMA journal_mode=WAL')
+    db.execute('BEGIN IMMEDIATE')
     try:
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA busy_timeout=20000')
-        db.execute('PRAGMA journal_mode=WAL')
         db.execute('''CREATE TABLE IF NOT EXISTS jobs (
             job_id TEXT PRIMARY KEY, origin TEXT NOT NULL, collection TEXT NOT NULL,
             filename TEXT NOT NULL, source TEXT, source_sha256 TEXT,
@@ -66,7 +73,8 @@ def connect():
         db.execute('CREATE INDEX IF NOT EXISTS job_queue ON jobs (requested,status,created_at)')
         db.execute('CREATE INDEX IF NOT EXISTS job_digest ON jobs (collection,source_sha256)')
         index_row = db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='job_one_active_digest'").fetchone()
-        if index_row is not None and '(collection, source_sha256)' not in index_row['sql']:
+        if index_row is not None and ('(collection, source_sha256)' not in index_row['sql'] or
+                                      "'FAILED'" not in index_row['sql']):
             db.execute('DROP INDEX job_one_active_digest')
             index_row = None
         if index_row is None:
@@ -86,6 +94,29 @@ def connect():
                 ON CONFLICT(scope) DO UPDATE SET version=version+1;
                 END''')
         db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+@contextmanager
+def connect():
+    """Independent journal transactions; schema DDL only for a new DB identity."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _SCHEMA_LOCK:
+        db = sqlite3.connect(str(DB_PATH), timeout=20)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA busy_timeout=20000')
+            key = _file_identity(DB_PATH)
+            if key not in _SCHEMA_READY:
+                _initialize_schema(db)
+                # Commit succeeded; only now cache the observed file identity.
+                _SCHEMA_READY.add(_file_identity(DB_PATH))
+        except BaseException:
+            db.close()
+            raise
+    try:
         before = db.total_changes
         try:
             with db:

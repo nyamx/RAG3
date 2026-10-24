@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from rag3.constants import ROOT, DATA_ROOT
+from rag3.qdrant_clients import get_client
 from rag3.ingestion_manager import Scheduler, dispatch, JOB_ROOT, PORT as OLD_PORT
 from rag3.ingestion_jobs import (connect, one, patch, ingestion_progress,
                                  set_ingestion_progress, clear_ingestion_progress,
@@ -47,16 +48,19 @@ def _source_counts(client, collection, sha):
 
 def _client(url):
     from qdrant_client import QdrantClient
-    return QdrantClient(url=url)
+    return get_client(url=url)
 
 
-def _compatible(job, *, url, check_qdrant=True):
+def _compatible(job, *, url, check_qdrant=True, source_guard=None):
     """Fail closed while preserving checkpoint and all Qdrant points."""
     path=Path(job['source']) if job.get('source') else None
     if path is None or not path.is_file():
         raise ValueError('Original file missing')
-    if sha256_file(path) != job.get('source_sha256'):
-        raise ValueError('Original SHA-256 mismatch')
+    if source_guard is None or not source_guard.strong:
+        if sha256_file(path) != job.get('source_sha256'):
+            raise ValueError('Original SHA-256 mismatch')
+    elif source_guard.source != path.resolve() or source_guard.expected_sha != job.get('source_sha256'):
+        raise ValueError('Original source handle identity mismatch')
     progress=ingestion_progress(job['collection'], job['source_sha256'])
     if not progress or progress['identity'] != progress_identity(job['source_sha256'],job['collection']):
         raise ValueError('Checkpoint identity missing or incompatible')
@@ -155,14 +159,14 @@ def _stage_plain(source,collection,sha,progress,should_stop,emit,url,*,commit_ba
 
 
 def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
-                  clear_request=None, commit_batch=None):
+                  clear_request=None, commit_batch=None, source_guard=None):
     source,collection,sha=Path(job['source']),job['collection'],job['source_sha256']
     c=_client(url)
     cfg=_bm25_config(c,collection)
     while True:
         if should_stop():
             return {'status':'PAUSED'}
-        progress=_compatible(job,url=url,check_qdrant=False)
+        progress=_compatible(job,url=url,check_qdrant=False,source_guard=source_guard)
         if progress['phase']=='PARSING':
             raise ValueError('Embedding requires completed parsing')
         points,_=c.scroll(collection_name=collection,scroll_filter=_source_filter(sha,'parsed'),
@@ -202,7 +206,7 @@ def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
         elif not commit_batch(c, collection, ready):
             return {'status':'PAUSED'}
         emit(f'STAGE embedding {len(ready)} written')
-    progress=_compatible(job,url=url,check_qdrant=False)
+    progress=_compatible(job,url=url,check_qdrant=False,source_guard=source_guard)
     total=progress['total_chunks']
     counts=_source_counts(c,collection,sha)
     if any(n!=total for n in counts) or total<=0:
@@ -213,6 +217,32 @@ def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
             'source_point_count':counts[0],'source_dense_count':counts[1],
             'source_bm25_count':counts[2],
             'count_after':c.count(collection_name=collection,exact=True).count}
+
+
+def _verify_reparsed_points(client, collection, sha, expected):
+    """Fail closed before embedding if old/new parsed ID sets do not coincide."""
+    import hashlib
+    import uuid
+    if not isinstance(expected, dict) or expected.get('status') != 'PARSED':
+        raise ValueError('CPU parser did not return verified chunk count')
+    count = expected.get('total_chunks')
+    digest = expected.get('chunk_ids_sha256')
+    if not isinstance(count,int) or count < 1 or not isinstance(digest,str) or len(digest)!=64:
+        raise ValueError('CPU parser omitted parsed-ID verification')
+    points=[]
+    cursor=None
+    while True:
+        batch,cursor=client.scroll(collection_name=collection,
+            scroll_filter=_source_filter(sha), limit=256, offset=cursor,
+            with_payload=True, with_vectors=False)
+        for point in batch:
+            if (point.payload or {}).get('meta',{}).get('_rag3_ingest_state')!='parsed':
+                raise ValueError('Cannot resume: ready or foreign source points present')
+            points.append(str(uuid.UUID(str(point.id))))
+        if cursor is None: break
+    computed=hashlib.sha256(('\n'.join(sorted(points))).encode('utf-8')).hexdigest()
+    if len(points)!=count or computed!=digest:
+        raise ValueError('Reparsed point IDs differ; explicit Restart required')
 
 
 class BackendScheduler(Scheduler):
@@ -232,6 +262,8 @@ class BackendScheduler(Scheduler):
         self._thread=None
         self._gpu_request=None
         self._parser_job=None
+        from rag3.persistent_parser import PersistentCPUParser
+        self._persistent_parser = PersistentCPUParser(self._parser_stage)
 
     def boot(self):
         if self._started:
@@ -241,12 +273,20 @@ class BackendScheduler(Scheduler):
             sock.settimeout(.2)
             if sock.connect_ex(('127.0.0.1',self._legacy_port))==0:
                 raise RuntimeError('Legacy ingestion manager port is occupied; refuse dual scheduler')
-        with self.lock:
-            self.recover()
-            self._started=True
-            self._thread=threading.Thread(target=self.pump,name='rag3-ingestion-scheduler',daemon=True)
-            self._thread.start()
+        try:
+            with self.lock:
+                self._persistent_parser.start()  # Qdrant outage cannot delay parser startup.
+                self.recover()
+                self._started=True
+                self._thread=threading.Thread(target=self.pump,name='rag3-ingestion-scheduler',daemon=True)
+                self._thread.start()
+                self._wake.set()
+        except BaseException:
+            self._stop.set()
             self._wake.set()
+            self._started=False
+            self._persistent_parser.stop()  # Boot has no caller-owned finally yet.
+            raise
 
     def recover(self):
         with connect() as db:
@@ -325,8 +365,7 @@ class BackendScheduler(Scheduler):
                                              stage='Cancel accepted; finish current GPU batch')
                 if self._gpu_request is not None:
                     self._gpu_request.cancel()
-                if self.proc is not None:
-                    self._terminate_parser(self.proc,self._parser_job)
+                self._persistent_parser.cancel(job_id)
                 self._wake.set()
                 return one(job_id)
             value=super().action(job_id,operation)
@@ -409,69 +448,20 @@ class BackendScheduler(Scheduler):
                 pass
         self.kill_worker(proc)
 
+    def parser_snapshot(self):
+        return self._persistent_parser.snapshot()
+
+    def _parser_stage(self,job_id,message):
+        # The callback runs on the protocol reader. Do not write a cancelled
+        # job's progress into a later or unrelated ingestion.
+        if self.active_id == job_id:
+            with connect() as db:
+                patch(db,job_id,stage=message)
+
     def _parse_cpu(self,job):
         if self._stopping(job):
             return {'status':'PAUSED'}
-        env=os.environ.copy()
-        env.update(CUDA_VISIBLE_DEVICES='-1',OMP_NUM_THREADS='2',MKL_NUM_THREADS='2',
-                   OPENBLAS_NUM_THREADS='2',RAG3_PARSE_CPU_ONLY='1')
-        parser_job=None
-        if os.name=='nt':
-            from rag3.windows_job import WindowsParserJob
-            parser_job=WindowsParserJob()
-            env['RAG3_PARSE_PARENT_GATE']='1'
-        args=[sys.executable,str(ROOT/'scripts'/'ingest-worker.py'),job['source'],
-              '--collection',job['collection'],'--phase','parse','--source-sha',job['source_sha256']]
-        creation=getattr(subprocess,'CREATE_NO_WINDOW',0) if os.name=='nt' else 0
-        proc=None
-        try:
-            proc=subprocess.Popen(args,cwd=ROOT,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                                  stdin=subprocess.PIPE if parser_job is not None else subprocess.DEVNULL,
-                                  text=True,encoding='utf-8',errors='replace',close_fds=True,
-                                  creationflags=creation,start_new_session=os.name!='nt')
-            if parser_job is not None:
-                # Until assignment succeeds the child blocks before parsing.
-                parser_job.assign(proc.pid)
-            with self.lock:
-                self.proc=proc
-                self._parser_job=parser_job
-                if self._stopping(job):
-                    self._terminate_parser(proc,parser_job)
-                elif parser_job is not None:
-                    assert proc.stdin is not None
-                    proc.stdin.write('G')
-                    proc.stdin.flush()
-                    proc.stdin.close()
-            result=None; error=None
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                try: evt=json.loads(line)
-                except ValueError: continue
-                if evt.get('type')=='result': result=evt.get('result')
-                elif evt.get('type')=='error': error=str(evt.get('message'))[:400]
-                elif evt.get('type')=='log': self._stage(job, str(evt.get('message'))[:240])
-            code=proc.wait()
-        except Exception:
-            if proc is not None and proc.poll() is None:
-                self._terminate_parser(proc,parser_job)
-                try: proc.wait(timeout=8)
-                except subprocess.TimeoutExpired: self.kill_worker(proc)
-            raise
-        finally:
-            with self.lock:
-                if self.proc is proc: self.proc=None
-                if self._parser_job is parser_job: self._parser_job=None
-            if proc is not None and proc.stdin is not None and not proc.stdin.closed:
-                proc.stdin.close()
-            if parser_job is not None:
-                parser_job.close()
-        if self._stopping(job):
-            return {'status':'PAUSED'}
-        if code==75 and isinstance(result,dict) and result.get('status')=='PAUSED':
-            return result
-        if code!=0 or not isinstance(result,dict) or result.get('status')!='PARSED':
-            raise RuntimeError(error or f'CPU parser exited {code}')
-        return result
+        return self._persistent_parser.parse(job, cancelled=lambda:self._stopping(job))
 
     def _stage(self,job,message):
         with connect() as db: patch(db,job['job_id'],stage=message)
@@ -502,12 +492,14 @@ class BackendScheduler(Scheduler):
             return True
 
     def _execute(self,job):
-        result=None; error=None; completed=False
+        from rag3.source_guard import OriginalSourceGuard
+        result=None; error=None; completed=False; source_guard=None
         try:
+            source_guard=OriginalSourceGuard(job['source'], job['source_sha256'])
             sha,collection=job['source_sha256'],job['collection']
             progress=ingestion_progress(collection,sha)
             if job['mode']=='resume':
-                progress=_compatible(job,url=self.qdrant_url)
+                progress=_compatible(job,url=self.qdrant_url,source_guard=source_guard)
             elif progress is not None:
                 raise ValueError('Existing checkpoint: explicit validated Resume/Restart required')
             else:
@@ -524,19 +516,23 @@ class BackendScheduler(Scheduler):
                                  commit_batch=lambda client,collection,points:
                                      self._commit_batch(job,client,collection,points))
                 else:
-                    self._parse_cpu(job)
+                    parsed=self._parse_cpu(job)
+                    if not self._stopping(job):
+                        _verify_reparsed_points(_client(self.qdrant_url),collection,sha,parsed)
             if not self._stopping(job):
                 self._stage(job,'STAGE embedding RUN')
                 result=_embed_source(job,self.gpu,lambda:self._stopping(job),
                                      lambda msg:self._stage(job,msg),self.qdrant_url,
                                      register_request=lambda request:self._register_gpu_request(job,request),
-                                     clear_request=self._clear_gpu_request,
+                                     clear_request=self._clear_gpu_request, source_guard=source_guard,
                                      commit_batch=lambda client,collection,points:
                                          self._commit_batch(job,client,collection,points))
                 completed=result.get('status')=='COMPLETE'
         except Exception as exc:
             error=f'{type(exc).__name__}: {exc}'[:400]
         finally:
+            if source_guard is not None:
+                source_guard.close()
             with self.lock:
                 try:
                     current=one(job['job_id'],private=True)
@@ -559,7 +555,6 @@ class BackendScheduler(Scheduler):
                         mark_change(content_scope(job['collection']))
                 finally:
                     self.active_id=None
-                    self.proc=None
                     self._task=None
                     self._gpu_request=None
                     self._wake.set()
@@ -579,5 +574,4 @@ class BackendScheduler(Scheduler):
                     pass  # Startup recovery will reconcile the unchanged journal.
             if self._gpu_request is not None:
                 self._gpu_request.cancel()
-            if self.proc is not None:
-                self._terminate_parser(self.proc,self._parser_job)
+            self._persistent_parser.stop()

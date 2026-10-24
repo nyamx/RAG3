@@ -15,6 +15,7 @@ from urllib.parse import quote
 from qdrant_client import QdrantClient, models
 
 from rag3.constants import DEFAULT_QDRANT_URL, ROOT, DATA_ROOT
+from rag3.qdrant_clients import get_client
 from rag3.source_identity import sha256_file
 
 # A transport block, not a file-size limit. JSON/base64 plus SSE framing must
@@ -43,7 +44,7 @@ def _resolve(collection: str, document_id: str, *, url: str,
             or not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", document_id)
             or document_id in {".", ".."}):
         raise SourceError("INVALID_ARGUMENT", "Use a collection and document_id returned by RAG3.")
-    client = QdrantClient(url=url)
+    client = get_client(url=url)
     try:
         if not client.collection_exists(collection):
             raise SourceError("DOCUMENT_NOT_FOUND", "Collection does not exist.")
@@ -52,7 +53,7 @@ def _resolve(collection: str, document_id: str, *, url: str,
                 key="meta.document_id", match=models.MatchValue(value=document_id))]),
             limit=1, with_payload=True, with_vectors=False)
     finally:
-        client.close()
+        pass  # shared client lifetime owned by process
     if not records:
         raise SourceError("DOCUMENT_NOT_FOUND", "Document does not exist in this collection.")
     meta = (records[0].payload or {}).get("meta") or {}

@@ -9,20 +9,21 @@ from uuid import UUID
 from qdrant_client import QdrantClient, models
 
 from rag3.constants import DEFAULT_QDRANT_URL
+from rag3.qdrant_clients import get_client
 from rag3.ingestion_jobs import content_scope, mark_change
 
 
 def list_collections(*, url: str = DEFAULT_QDRANT_URL) -> list[str]:
-    return sorted(item.name for item in QdrantClient(url=url).get_collections().collections)
+    return sorted(item.name for item in get_client(url=url).get_collections().collections)
 
 
 def create_collection(name: str, *, url: str = DEFAULT_QDRANT_URL,
                       bm25_k: float = 1.2, bm25_b: float = 0.75,
                       bm25_avg_len: float = 256.0,
                       reuse_existing: bool = False) -> dict:
-    from rag3.haystack_native import create_document_store
+    from rag3.qdrant_store import create_document_store
 
-    if QdrantClient(url=url).collection_exists(name) and not reuse_existing:
+    if get_client(url=url).collection_exists(name) and not reuse_existing:
         raise ValueError(f"collection already exists: {name}")
     store = create_document_store(collection=name, url=url, recreate_index=False,
                                   bm25_k=bm25_k, bm25_b=bm25_b,
@@ -34,7 +35,7 @@ def create_collection(name: str, *, url: str = DEFAULT_QDRANT_URL,
 def delete_collections(names: list[str], *, url: str = DEFAULT_QDRANT_URL) -> dict:
     if not names:
         raise ValueError("at least one collection is required")
-    client = QdrantClient(url=url)
+    client = get_client(url=url)
     existing = set(list_collections(url=url))
     missing = [name for name in names if name not in existing]
     if missing:
@@ -49,11 +50,11 @@ def delete_collections(names: list[str], *, url: str = DEFAULT_QDRANT_URL) -> di
 def collection_contents(collection: str, *, url: str = DEFAULT_QDRANT_URL,
                         create_if_missing: bool = False) -> dict:
     """Read only the payload fields needed for the UI and MCP document list."""
-    client = QdrantClient(url=url)
+    client = get_client(url=url)
     if not client.collection_exists(collection):
         if not create_if_missing:
             raise ValueError(f"collection does not exist: {collection}")
-        from rag3.haystack_native import create_document_store
+        from rag3.qdrant_store import create_document_store
         create_document_store(collection=collection, url=url, recreate_index=False)
     grouped: dict[str, dict] = {}
     chunk_count = 0
@@ -108,7 +109,7 @@ def get_document(collection: str, document_id: str, *, url: str = DEFAULT_QDRANT
     result = collection_contents(collection, url=url)
     for item in result["documents"]:
         if item["document_id"] == document_id:
-            client = QdrantClient(url=url)
+            client = get_client(url=url)
             condition = models.Filter(must=[models.FieldCondition(
                 key="meta.document_id", match=models.MatchValue(value=document_id))])
             points = []
@@ -199,7 +200,7 @@ def update_chunk_sections(collection: str, document_id: str, updates: list[dict]
             raise ValueError("add mode requires at least one section path per chunk")
         requested[point_id] = paths
 
-    client = QdrantClient(url=url)
+    client = get_client(url=url)
     records = client.retrieve(collection_name=collection, ids=list(requested),
                               with_payload=True, with_vectors=False)
     by_id = {str(record.id): record for record in records}
@@ -237,7 +238,7 @@ def update_chunk_sections(collection: str, document_id: str, updates: list[dict]
 def delete_document(collection: str, document_id: str, *, url: str = DEFAULT_QDRANT_URL) -> dict:
     # Resolve first so a typo never becomes a silent successful deletion.
     item = get_document(collection, document_id, url=url)
-    client = QdrantClient(url=url)
+    client = get_client(url=url)
     condition = models.Filter(must=[models.FieldCondition(
         key="meta.document_id", match=models.MatchValue(value=document_id))])
     client.delete(collection_name=collection,

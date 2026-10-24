@@ -8,14 +8,11 @@ from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRe
 from haystack_integrations.document_stores.qdrant.converters import DENSE_VECTORS_NAME
 from qdrant_client import QdrantClient, models as qdrant_models
 
-from rag3.haystack_native import (
-    BGEM3OnePassEmbedder,
-    BM25_VECTOR_NAME,
-    DEFAULT_NATIVE_COLLECTION,
-    DEFAULT_QDRANT_URL,
-    collection_bm25_config,
-    create_document_store,
-)
+from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
+from rag3.retrieval_embedding import BGEM3OnePassEmbedder
+from rag3.qdrant_bm25 import collection_bm25_config
+from rag3.qdrant_clients import get_client
+BM25_VECTOR_NAME = 'bm25'
 
 Mode = Literal["dense", "sparse", "hybrid"]
 
@@ -46,6 +43,7 @@ def build_retrieval_pipeline(
     """Build the Haystack dense path; use search() for BM25 or fused retrieval."""
     if mode != "dense":
         raise ValueError("Use search() for BM25 or semantic+BM25 retrieval")
+    from rag3.qdrant_store import create_document_store
     store = create_document_store(
         collection=collection,
         url=qdrant_url,
@@ -150,9 +148,14 @@ def search(
         if not any((query_filter.must, query_filter.should, query_filter.must_not, query_filter.min_should)):
             raise ValueError("metadata_filter must contain at least one condition")
 
-    client = QdrantClient(url=qdrant_url)
-    if not client.collection_exists(collection):
-        raise ValueError(f"collection does not exist: {collection}")
+    client = get_client(url=qdrant_url)
+    from qdrant_client.http.exceptions import UnexpectedResponse
+    try:
+        info = client.get_collection(collection_name=collection)
+    except UnexpectedResponse as exc:
+        if exc.status_code == 404:
+            raise ValueError(f"collection does not exist: {collection}") from exc
+        raise
 
     dense_query: list[float] | None = None
     if semantic:
@@ -167,7 +170,7 @@ def search(
         bm25_query = qdrant_models.Document(
             text=query,
             model="qdrant/bm25",
-            options=collection_bm25_config(collection, url=qdrant_url),
+            options=collection_bm25_config(collection, url=qdrant_url, client=client, collection_info=info),
         )
 
     query_by_method = {

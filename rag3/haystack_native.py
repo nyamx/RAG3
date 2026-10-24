@@ -24,7 +24,8 @@ from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
 from haystack_integrations.document_stores.qdrant.converters import (
     convert_haystack_documents_to_qdrant_points,
 )
-from qdrant_client import QdrantClient, models as qdrant_models
+from qdrant_client import models as qdrant_models
+from rag3.qdrant_clients import get_client
 
 from rag3.source_identity import sha256_file
 from rag3.constants import ROOT, DATA_ROOT, DEFAULT_QDRANT_URL, DEFAULT_NATIVE_COLLECTION
@@ -174,7 +175,7 @@ def _bm25_metadata(k: float, b: float, avg_len: float) -> dict[str, Any]:
 
 
 def _collection_bm25_settings(
-    client: QdrantClient,
+    client,
     collection: str,
 ) -> tuple[float, float, float]:
     info = client.get_collection(collection_name=collection).model_dump()
@@ -218,7 +219,7 @@ def collection_bm25_config(
     *,
     url: str = DEFAULT_QDRANT_URL,
 ) -> qdrant_models.Bm25Config:
-    client = QdrantClient(url=url)
+    client = get_client(url=url)
     k, b, avg_len = _collection_bm25_settings(client, collection)
     return bm25_config(k=k, b=b, avg_len=avg_len)
 
@@ -260,7 +261,7 @@ class QdrantBM25Writer:
             )
             for point, doc in zip(qdrant_points, documents, strict=True)
         ]
-        client = QdrantClient(url=self.url)
+        client = get_client(url=self.url)
         client.update_vectors(
             collection_name=self.collection,
             points=updates,
@@ -426,140 +427,12 @@ def normalize_chunk(doc: Document, idx: int) -> Document:
     return Document(id=chunk_id, content=content, meta=meta)
 
 
-@component
-class BGEM3OnePassEmbedder:
-    """Haystack component that emits only BGE-M3 dense vectors."""
-
-    def __init__(
-        self,
-        model_path: str | None = None,
-        batch_size: int = BGE_BATCH_SIZE,
-        max_length: int = 8192,
-        device: str | None = None,
-    ) -> None:
-        self.model_path = model_path or str(find_bge_m3())
-        self.batch_size = int(batch_size)
-        self.max_length = int(max_length)
-        self.device = device
-        self._model: BGEM3FlagModel | None = None
-
-    def warm_up(self) -> None:
-        if self._model is not None:
-            return
-        import torch
-        from FlagEmbedding import BGEM3FlagModel
-
-        device = self.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-        self._model = BGEM3FlagModel(
-            self.model_path,
-            use_fp16=device.startswith("cuda"),
-            pooling_method="cls",
-            devices=device,
-        )
-
-    def _encode(self, texts: list[str], *, query: bool) -> list[list[float]]:
-        self.warm_up()
-        if self._model is None:
-            raise RuntimeError("BGE-M3 model did not initialize")
-        from rag3.bge_dense import encode_dense
-        return encode_dense(self._model, texts, query=query,
-                            batch_size=self.batch_size, max_length=self.max_length)
-
-    @component.output_types(
-        documents=list[Document],
-        embedding=list[float],
-    )
-    def run(
-        self,
-        documents: list[Document] | None = None,
-        text: str | None = None,
-    ) -> dict[str, Any]:
-        if (documents is None) == (text is None):
-            raise ValueError("Provide exactly one of documents or text")
-
-        if text is not None:
-            dense = self._encode([text], query=True)
-            return {
-                "documents": [],
-                "embedding": dense[0],
-            }
-
-        assert documents is not None
-        if not documents:
-            return {
-                "documents": [],
-                "embedding": [],
-            }
-
-        texts = [(doc.content or "") for doc in documents]
-        dense = self._encode(texts, query=False)
-        embedded: list[Document] = []
-
-        for idx, (doc, dvec) in enumerate(zip(documents, dense, strict=True)):
-            normalized = normalize_chunk(doc, idx)
-            embedded.append(
-                Document(
-                    id=normalized.id,
-                    content=normalized.content,
-                    meta=normalized.meta,
-                    embedding=dvec,
-                )
-            )
-
-        return {
-            "documents": embedded,
-            "embedding": [],
-        }
+from rag3.retrieval_embedding import BGEM3OnePassEmbedder
 
 
-def create_document_store(
-    *,
-    collection: str = DEFAULT_NATIVE_COLLECTION,
-    url: str = DEFAULT_QDRANT_URL,
-    recreate_index: bool = False,
-    bm25_k: float = DEFAULT_BM25_K,
-    bm25_b: float = DEFAULT_BM25_B,
-    bm25_avg_len: float = DEFAULT_BM25_AVG_LEN,
-) -> QdrantDocumentStore:
-    from rag3.ingestion_jobs import mark_change
-
-    client = QdrantClient(url=url)
-
-    if recreate_index and client.collection_exists(collection):
-        client.delete_collection(collection_name=collection)
-
-    if not client.collection_exists(collection):
-        client.create_collection(
-            collection_name=collection,
-            vectors_config={
-                "text-dense": qdrant_models.VectorParams(
-                    size=1024,
-                    distance=qdrant_models.Distance.COSINE,
-                )
-            },
-            sparse_vectors_config={
-                BM25_VECTOR_NAME: qdrant_models.SparseVectorParams(
-                    modifier=qdrant_models.Modifier.IDF
-                ),
-            },
-            metadata=_bm25_metadata(bm25_k, bm25_b, bm25_avg_len),
-        )
-        mark_change('collections')
-    else:
-        _collection_bm25_settings(client, collection)
-
-    return QdrantDocumentStore(
-        url=url,
-        index=collection,
-        embedding_dim=1024,
-        # Haystack uses this flag to address the named "text-dense" vector.
-        # Documents carry no BGE sparse_embedding, so none is written.
-        use_sparse_embeddings=True,
-        similarity="cosine",
-        recreate_index=False,
-        return_embedding=False,
-        progress_bar=False,
-    )
+def create_document_store(**kwargs):
+    from rag3.qdrant_store import create_document_store as impl
+    return impl(**kwargs)
 
 
 def build_parsing_pipeline(
@@ -617,6 +490,8 @@ def build_parsing_pipeline(
         ),
     )
     pipe.connect("converter.documents", "splitter.documents")
+    # Explicit lifetime owner for the service; never reconstruct on each request.
+    pipe._rag3_docling_converter = docling_converter
     return pipe
 
 

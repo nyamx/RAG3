@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
 import traceback
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +22,19 @@ from rag3.ingestion_settings import CHUNK_GROUP_SIZE, progress_identity
 from rag3.source_identity import sha256_file
 
 
+_SERVICE_WRITER = None
+_ACTIVE_REQUEST_ID = None
+
+
 def emit(kind: str, **payload) -> None:
-    print(json.dumps({"type": kind, **payload}, ensure_ascii=True), flush=True)
+    evt = {"type": kind, **payload}
+    if _SERVICE_WRITER is not None:
+        if _ACTIVE_REQUEST_ID is not None and kind in ('log', 'result', 'error', 'paused'):
+            evt['request_id'] = _ACTIVE_REQUEST_ID
+        _SERVICE_WRITER.write(json.dumps(evt, ensure_ascii=True) + '\n')
+        _SERVICE_WRITER.flush()
+    else:
+        print(json.dumps(evt, ensure_ascii=True), flush=True)
 
 
 def pause_request_path(source_sha: str) -> Path:
@@ -51,7 +64,8 @@ def source_filter(source_sha: str, *, phase: str | None = None):
     return models.Filter(must=conditions)
 
 
-def parse_source(source: Path, collection: str, source_sha: str | None = None) -> dict:
+def parse_source(source: Path, collection: str, source_sha: str | None = None,
+                 *, parsing_pipeline=None, qdrant_client=None) -> dict:
     """Convert the whole source, then stage its chunks in bounded Qdrant writes."""
     from haystack_integrations.document_stores.qdrant.converters import (
         convert_haystack_documents_to_qdrant_points,
@@ -67,7 +81,7 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
     preserved = preserve_source(source, expected_sha256=source_sha)
     source_sha = preserved["source_sha256"]
     identity = progress_identity(source_sha, collection)
-    client = QdrantClient(url=os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL))
+    client = qdrant_client or QdrantClient(url=os.environ.get("RAG3_QDRANT_URL", DEFAULT_QDRANT_URL))
     progress = ingestion_progress(collection, source_sha)
     if progress is None:
         raise ValueError("Parsing requires an initialized matching ingestion progress; refuse unscoped reset")
@@ -90,6 +104,9 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
     emit("log", message="STAGE parse RUN")
     emit("log", message="STAGE qdrant RUN")
 
+    # Same IDs as those actually sent to Qdrant by the converter.
+    staged_point_ids: list[str] = []
+
     def stage(documents: list, first_index: int) -> bool:
         for start in range(0, len(documents), CHUNK_GROUP_SIZE):
             staged = []
@@ -97,13 +114,12 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
                 chunk = normalize_chunk(documents[idx], first_index + idx)
                 chunk.meta["_rag3_ingest_state"] = "parsed"
                 staged.append(chunk)
-            client.upsert(
-                collection_name=collection,
-                points=convert_haystack_documents_to_qdrant_points(
-                    staged, use_sparse_embeddings=True,
-                ),
-                wait=True,
+            points = convert_haystack_documents_to_qdrant_points(
+                staged, use_sparse_embeddings=True,
             )
+            client.upsert(collection_name=collection, points=points, wait=True)
+            # Record exactly the converted point IDs used in the successful write.
+            staged_point_ids.extend(str(uuid.UUID(str(point.id))) for point in points)
             emit("log", message=f"STAGE qdrant STORED {first_index + start + len(staged)}")
             del staged
             if pause_if_requested(source_sha):
@@ -117,7 +133,7 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
     else:
         docling_source = prepare_docling_source(preserved)
         # Child parser is CPU-only; it must never initialize CUDA/OCR on GPU.
-        pipeline = build_parsing_pipeline(pdf_cpu=True)
+        pipeline = parsing_pipeline if parsing_pipeline is not None else build_parsing_pipeline(pdf_cpu=True)
         parsed = pipeline.run({"converter": {
             "sources": [str(docling_source)], "meta": base_meta,
         }})
@@ -125,6 +141,11 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
     total = len(chunks)
     if not stage(chunks, 0):
         return {"status": "PAUSED", "source_sha256": source_sha}
+    # The field name remains stable for the existing parser-service protocol;
+    # its value is the digest of Qdrant point IDs, not Haystack Document IDs.
+    if len(staged_point_ids) != total or len(set(staged_point_ids)) != total:
+        raise RuntimeError('Parsed Qdrant point ID count or uniqueness mismatch')
+    digest = hashlib.sha256(('\n'.join(sorted(staged_point_ids))).encode('utf-8')).hexdigest()
     if total < 1:
         raise ValueError("Document produced no searchable chunks")
     set_ingestion_progress(collection, source_sha, identity, "CHUNKS_STORED", total)
@@ -132,7 +153,7 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None) -
     emit("log", message="STAGE chunk PASS")
     emit("log", message="STAGE qdrant PASS")
     return {"status": "PARSED", "source_sha256": source_sha,
-            "total_chunks": total}
+            "total_chunks": total, "chunk_ids_sha256": digest}
 
 
 def verify_source(client, collection: str, source_sha: str) -> tuple[int, int, int, int]:
@@ -316,15 +337,100 @@ def run_job(source: Path, collection: str, mode: str,
     return run_phase(source, collection, "embed", source_sha)
 
 
+
+def parser_service():
+    """One CPU-only converter, many serial requests, dedicated response pipe."""
+    global _SERVICE_WRITER, _ACTIVE_REQUEST_ID
+    import re
+    if os.environ.get('RAG3_PARSE_CPU_ONLY') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != '-1':
+        raise RuntimeError('CPU parser isolation not enabled')
+    if os.environ.get('RAG3_PARSE_PARENT_GATE') == '1' and sys.stdin.read(1) != 'G':
+        raise RuntimeError('CPU parser parent gate closed')
+    if os.name == 'nt':
+        import msvcrt
+        h = int(os.environ['RAG3_PARSER_RESPONSE_HANDLE'])
+        fd = msvcrt.open_osfhandle(h, os.O_WRONLY | os.O_BINARY)
+    else:
+        fd = int(os.environ['RAG3_PARSER_RESPONSE_FD'])
+    _SERVICE_WRITER = os.fdopen(fd, 'w', encoding='utf-8', buffering=1)
+    from rag3.haystack_native import build_parsing_pipeline
+    from docling.datamodel.base_models import InputFormat
+    from qdrant_client import QdrantClient
+
+    try:
+        pipeline = build_parsing_pipeline(pdf_cpu=True)
+        converter = pipeline._rag3_docling_converter
+        requested = {
+            'pdf': 'PDF', 'image': 'IMAGE', 'docx': 'DOCX', 'pptx': 'PPTX',
+            'xlsx': 'XLSX', 'html': 'HTML', 'md': 'MD', 'csv': 'CSV',
+        }
+        prepared = {}
+        for name, key in requested.items():
+            fmt = getattr(InputFormat, key)
+            if fmt not in converter.format_to_options:
+                raise RuntimeError('Required Docling format is unavailable: '+name)
+            converter.initialize_pipeline(fmt)
+            option = converter.format_to_options[fmt]
+            # This cache object identity is stable across document requests.
+            cache_key = (option.pipeline_cls.__name__,
+                         __import__('hashlib').sha256(repr(option.pipeline_options).encode('utf-8')).hexdigest()[:16])
+            prepared[name] = '|'.join(cache_key)
+        emit('ready', pipelines=prepared)
+    except Exception as exc:
+        emit('fatal', code='PARSER_INITIALIZATION_FAILED', exception=type(exc).__name__)
+        raise
+    client = None
+    try:
+        for raw in sys.stdin:
+            if len(raw) > 32768:
+                emit('fatal', code='COMMAND_TOO_LARGE'); break
+            try:
+                msg = json.loads(raw)
+                if not isinstance(msg, dict): raise ValueError('object required')
+                if msg.get('command') == 'shutdown': break
+                if msg.get('command') != 'parse': raise ValueError('invalid command')
+                rid = msg.get('request_id')
+                jid = msg.get('job_id')
+                sha = msg.get('source_sha256')
+                src = msg.get('source')
+                collection = msg.get('collection')
+                if (not isinstance(rid,str) or not re.fullmatch('[0-9a-f]{32}',rid) or
+                        not isinstance(jid,str) or not re.fullmatch('[0-9a-f]{32}',jid) or
+                        not isinstance(sha,str) or not re.fullmatch('[0-9a-f]{64}',sha) or
+                        not isinstance(src,str) or len(src)>4096 or not Path(src).is_file() or
+                        not isinstance(collection,str) or not 1<=len(collection)<=255):
+                    raise ValueError('invalid parser request fields')
+                _ACTIVE_REQUEST_ID = rid
+                if client is None:
+                    client = QdrantClient(url=os.environ.get('RAG3_QDRANT_URL', DEFAULT_QDRANT_URL))
+                result = parse_source(Path(src), collection, sha, parsing_pipeline=pipeline, qdrant_client=client)
+                emit('result', result=result)
+            except Exception as exc:
+                emit('error', code='PARSE_FAILED', exception=type(exc).__name__)
+                # Private stderr diagnostics, never sent via API or health.
+                traceback.print_exc(limit=12, file=sys.stderr)
+            finally:
+                _ACTIVE_REQUEST_ID = None
+    finally:
+        if client is not None: client.close()
+        _SERVICE_WRITER.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("document")
+    parser.add_argument("document", nargs="?")
+    parser.add_argument("--parser-service", action="store_true")
     parser.add_argument("--collection", default=DEFAULT_NATIVE_COLLECTION)
     parser.add_argument("--mode", choices=("run", "resume", "restart"), default="run")
     parser.add_argument("--phase", choices=("coordinate", "parse", "embed"),
                         default="coordinate")
     parser.add_argument("--source-sha", default=None)
     args = parser.parse_args()
+    if args.parser_service:
+        parser_service()
+        return
+    if not args.document:
+        parser.error('document is required')
     source = Path(args.document).expanduser().resolve()
     try:
         if args.phase == "parse" and os.environ.get("RAG3_PARSE_PARENT_GATE") == "1":

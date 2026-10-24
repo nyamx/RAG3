@@ -29,6 +29,7 @@ from mcp.server.mcpserver.resources.types import TextResource
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
 from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
+from rag3.qdrant_clients import get_client
 from rag3.backend_boundary import (BackendCommandFailure, SearchCallBudget,
                                    SessionCollections, session_identifier,
                                    install_routes, issue_ui_token, single_instance)
@@ -256,7 +257,7 @@ def _qdrant_point_id(raw: str):
 
 
 def _client() -> QdrantClient:
-    return QdrantClient(url=QDRANT_URL)
+    return get_client(url=QDRANT_URL)
 
 
 def _retrieve_record(point_id: str):
@@ -1130,11 +1131,11 @@ def _ui_command(action: str, p: dict, budget: SearchCallBudget | None = None) ->
     raise ValueError('Unknown UI API action')
 
 
-def _register_backend_routes(port: int) -> str:
+def _register_backend_routes(port: int, scheduler=None) -> str:
     token = issue_ui_token(ROOT, port)
     install_routes(mcp, root=ROOT, qdrant_url=QDRANT_URL,
                    ui_commands=_ui_command, ui_token=token,
-                   gpu_model_service=GPU_BGE_SERVICE)
+                   gpu_model_service=GPU_BGE_SERVICE, parser_scheduler=scheduler)
     return token
 
 
@@ -1157,7 +1158,7 @@ if __name__ == "__main__":
             scheduler.boot()
             try:
                 install_backend_scheduler(scheduler)
-                _register_backend_routes(port)
+                _register_backend_routes(port, scheduler)
                 mcp.run(transport=transport, host="127.0.0.1", port=port,
                         max_request_body_size=sys.maxsize)
             finally:

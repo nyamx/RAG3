@@ -368,7 +368,7 @@ def issue_ui_token(root: Path, port: int) -> str:
     return token
 
 
-def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: str, gpu_model_service=None):
+def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: str, gpu_model_service=None, parser_scheduler=None):
     """Add HTTP routes to the *same* MCP Starlette server instance.
 
     Custom routes bypass MCP SDK authorization, so the UI endpoint has its own
@@ -395,7 +395,9 @@ def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: s
                              'qdrant_transport': status,
                              'gpu_model': gpu['state'],
                              'gpu_model_scope': 'shared_backend_single_instance',
-                             'gpu_model_service': gpu})
+                             'gpu_model_service': gpu,
+                             'cpu_parser': (parser_scheduler.parser_snapshot() if parser_scheduler is not None
+                                            else {'state':'not_owned', 'ready':False})})
 
     @mcp.custom_route('/api/v1/command', methods=['POST'], include_in_schema=False)
     async def command(request: Request):
