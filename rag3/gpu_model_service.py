@@ -154,7 +154,7 @@ class GPUModelService:
     def snapshot(self) -> dict:
         # A health request never expires work, spins up a worker or imports ML.
         with self._condition:
-            return dict(state=self._state, scope='stage_b_service_only',
+            return dict(state=self._state, scope='shared_backend',
                         query_waiting=len(self._queries), document_waiting=len(self._documents),
                         document_deferred=self._deferred_document is not None,
                         active_kind=self._current.kind if self._current else None,

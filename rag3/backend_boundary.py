@@ -387,14 +387,14 @@ def install_routes(mcp, *, root: Path, qdrant_url: str, ui_commands, ui_token: s
                 return 'unreachable'
         status = await asyncio.to_thread(qdrant_transport)
         gpu = (gpu_model_service.snapshot() if gpu_model_service is not None else
-               {'state': 'not_initialized', 'scope': 'stage_b_service_only',
+               {'state': 'not_initialized', 'scope': 'shared_backend',
                 'query_waiting': 0, 'document_waiting': 0,
                 'active_kind': None, 'error_code': None, 'error_summary': None,
                 'model_load_count': 0})
         return JSONResponse({'backend': 'ready', 'pid': os.getpid(),
                              'qdrant_transport': status,
                              'gpu_model': gpu['state'],
-                             'gpu_model_scope': 'stage_b_service_only_legacy_paths_independent',
+                             'gpu_model_scope': 'shared_backend_single_instance',
                              'gpu_model_service': gpu})
 
     @mcp.custom_route('/api/v1/command', methods=['POST'], include_in_schema=False)

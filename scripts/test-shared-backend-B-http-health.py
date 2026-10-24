@@ -64,6 +64,9 @@ def main() -> None:
     token_path = ROOT / "data" / f"rag3-backend-ui-{port}.token"
     lock_path = ROOT / "data" / f"backend-test-{scope}.lock"
     assert not token_path.exists() and not lock_path.exists(), "Test scope collision"
+    test_data = tempfile.TemporaryDirectory(prefix="rag3-b-health-data-")
+    test_data_root = Path(test_data.name).resolve()
+    assert test_data_root.is_relative_to(Path(tempfile.gettempdir()).resolve())
 
     env = os.environ.copy()
     env.update({
@@ -71,6 +74,7 @@ def main() -> None:
         "RAG3_MCP_PORT": str(port),
         "RAG3_QDRANT_URL": f"http://127.0.0.1:{qdrant_port}",
         "RAG3_BACKEND_TEST_INSTANCE": scope,
+        "RAG3_TEST_DATA_ROOT": str(test_data_root),
         "RAG3_MCP_WRITE_ENABLED": "0",
         "RAG3_MCP_DELETE_ENABLED": "0",
     })
@@ -113,7 +117,7 @@ def main() -> None:
                 assert health["backend"] == "ready", health
                 assert health["qdrant_transport"] == "reachable", health
                 assert health["gpu_model_scope"] == \
-                    "stage_b_service_only_legacy_paths_independent", health
+                    "shared_backend_single_instance", health
                 assert service["state"] == health["gpu_model"] == "not_initialized", health
                 assert service["model_load_count"] == 0, service
                 assert service["query_waiting"] == service["document_waiting"] == 0, service
@@ -183,6 +187,7 @@ def main() -> None:
             # TempDirectory may have left the log while the child was alive.
             log_path.unlink()
             log_path.parent.rmdir()
+        test_data.cleanup()
         print("CLEANUP " + json.dumps({
             "server_exited": proc is None or proc.poll() is not None,
             "http_listener_stopped": stopped,

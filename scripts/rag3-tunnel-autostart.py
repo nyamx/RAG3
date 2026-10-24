@@ -1,6 +1,6 @@
 """Reconnect the existing RAG3 Secure MCP Tunnel using saved DPAPI credentials.
 
-Launched once after the tray-managed MCP server is listening. No UI or secrets in logs.
+Launched once after the login-managed shared backend is listening. No UI or secrets in logs.
 The tunnel-client CLI owns the persistent runtime process after `runtimes connect`.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ def autostart() -> None:
     if not CLIENT_SCRIPT.is_file():
         report("connector_not_found")
         return
-    # Prevent concurrent connector commands, including after a tray restart.
+    # Prevent concurrent connector commands, including after a backend restart.
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
     kernel.CreateMutexW.restype = ctypes.c_void_p
