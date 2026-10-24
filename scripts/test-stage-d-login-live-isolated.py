@@ -20,6 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ENTRY = ROOT / 'scripts' / 'rag3-backend-login.py'
+PREPARER = ROOT / 'scripts' / 'prepare-rag3-direct-pythonw.py'
+VENV_PYTHON = ROOT / '.venv' / 'Scripts' / 'python.exe'
+DIRECT_PYTHONW = ROOT / '.venv' / 'Scripts' / 'rag3-pythonw-direct.exe'
 
 class FakeQdrant(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -57,54 +60,8 @@ def request(url, token=None, action=None, timeout=2):
         return err.code, json.loads(err.read(16384))
 
 def assert_backend_owned_by_launcher(server_pid, launcher_pid):
-    """Windows venv python.exe can redirect to a child interpreter process.
-
-    Check ancestry rather than equating the launcher PID with the true
-    HTTP-backend PID. A preexisting server on the port must not pass.
-    """
-    if server_pid == launcher_pid:
-        return
-    import ctypes
-    from ctypes import wintypes
-    class ProcessEntry(ctypes.Structure):
-        _fields_ = [
-            ('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
-            ('th32ProcessID', wintypes.DWORD), ('th32DefaultHeapID', ctypes.c_void_p),
-            ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
-            ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', wintypes.LONG),
-            ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260),
-        ]
-    k = ctypes.WinDLL('kernel32', use_last_error=True)
-    k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    k.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
-    k.Process32FirstW.restype = wintypes.BOOL
-    k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
-    k.Process32NextW.restype = wintypes.BOOL
-    k.CloseHandle.argtypes = [wintypes.HANDLE]
-    k.CloseHandle.restype = wintypes.BOOL
-    snap = k.CreateToolhelp32Snapshot(2, 0)
-    if snap == ctypes.c_void_p(-1).value:
-        raise OSError('Cannot inspect Windows backend process ancestry')
-    parents = {}
-    try:
-        item = ProcessEntry()
-        item.dwSize = ctypes.sizeof(ProcessEntry)
-        ok = bool(k.Process32FirstW(snap, ctypes.byref(item)))
-        while ok:
-            parents[int(item.th32ProcessID)] = int(item.th32ParentProcessID)
-            ok = bool(k.Process32NextW(snap, ctypes.byref(item)))
-    finally:
-        k.CloseHandle(snap)
-    current = int(server_pid)
-    for _ in range(12):
-        if current == launcher_pid:
-            return
-        current = parents.get(current, 0)
-        if current == 0:
-            break
-    raise AssertionError('HTTP backend PID is not a descendant of the test launcher: '
-                         + str((launcher_pid,server_pid)))
+    """A direct base Pythonw copy must host the backend in its own process."""
+    assert server_pid == launcher_pid, (launcher_pid, server_pid)
 
 
 def await_port_closed(port, timeout=12):
@@ -152,6 +109,9 @@ def stop(proc):
 def main():
     if os.name != 'nt':
         raise RuntimeError('Windows-only live login test')
+    subprocess.run([str(VENV_PYTHON), str(PREPARER)], cwd=ROOT,
+                   stdin=subprocess.DEVNULL, check=True,
+                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     q = ThreadingHTTPServer(('127.0.0.1', 0), FakeQdrant)
     qt = threading.Thread(target=q.serve_forever, daemon=True)
     qt.start()
@@ -178,7 +138,7 @@ def main():
         production_db = ROOT / 'data' / 'ingestion_jobs.sqlite'
         db_before = (production_db.stat().st_size, production_db.stat().st_mtime_ns) if production_db.exists() else None
         try:
-            proc = subprocess.Popen([sys.executable,str(ENTRY),'--run','--config',str(cfg_path)],
+            proc = subprocess.Popen([str(DIRECT_PYTHONW),str(ENTRY),'--run','--config',str(cfg_path)],
                 cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -201,7 +161,7 @@ def main():
             assert proc.poll() is not None
             await_port_closed(port)
             # Reboot same config: same port, fresh local token, same test-only DB.
-            proc = subprocess.Popen([sys.executable,str(ENTRY),'--run','--config',str(cfg_path)],
+            proc = subprocess.Popen([str(DIRECT_PYTHONW),str(ENTRY),'--run','--config',str(cfg_path)],
                 cwd=ROOT,env=env,stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
