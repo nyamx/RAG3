@@ -70,7 +70,7 @@ internal static class Program
                 {
                     MessageBoxW(0,
                         $"RAG3 UI가 창을 열기 전에 종료되었습니다 (종료 코드 {process.ExitCode}).\n"
-                        + "Qdrant 실행 상태와 Python 가상환경을 확인하세요.",
+                        + "공용 RAG3 HTTP 백엔드와 Python 가상환경 상태를 확인하세요.",
                         "RAG3 시작 실패", MbIconError);
                     return 1;
                 }
