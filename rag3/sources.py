@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from qdrant_client import QdrantClient, models
 
-from rag3.constants import DEFAULT_QDRANT_URL, ROOT
+from rag3.constants import DEFAULT_QDRANT_URL, ROOT, DATA_ROOT
 from rag3.source_identity import sha256_file
 
 # A transport block, not a file-size limit. JSON/base64 plus SSE framing must
@@ -63,7 +63,7 @@ def _resolve(collection: str, document_id: str, *, url: str,
     if not isinstance(source_uri, str) or not source_uri:
         raise SourceError("SOURCE_UNAVAILABLE", "Document has no managed original source.")
     try:
-        managed_root = (ROOT / "data/sources").resolve()
+        managed_root = (DATA_ROOT / "sources").resolve()
         source = Path(source_uri).resolve(strict=True)
         expected_parent = managed_root / digest
         # Validate the resolved target too, so symlinks/junctions cannot escape.

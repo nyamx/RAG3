@@ -379,7 +379,7 @@ def _encode_query_gpu(text: str) -> list[float]:
     return vector
 
 
-def _search_impl(query: str, options: dict | None = None) -> dict:
+def _search_impl(query: str, options: dict | None = None, *, include_ui: bool = False) -> dict:
     from rag3.retrieval import search as core_search
 
     stripped = query.strip()
@@ -409,6 +409,7 @@ def _search_impl(query: str, options: dict | None = None) -> dict:
         raise ToolFailure("TIMEOUT", "Search exceeded its request deadline.", True)
 
     output: list[SearchResult] = []
+    ui_refs: dict[str, str] = {}
     seen: set[str] = set()
     if options and "top_k" in options:
         method_count = sum(bool(options.get(key)) for key in ("semantic", "bm25"))
@@ -461,9 +462,20 @@ def _search_impl(query: str, options: dict | None = None) -> dict:
         if source_url:
             item["source_url"] = source_url
         output.append(item)
+        if include_ui:
+            ui_refs[point_id] = item["id"]
         if len(output) >= result_limit:
             break
-    return {"results": output}
+    response = {"results": output}
+    if include_ui:
+        # No second retrieval: UI metadata and MCP excerpts share identical
+        # point IDs, ordering, filters and BGE/Qdrant call budget.
+        response["ui"] = {**result, "hits": [
+            {**hit, "id": ui_refs[str(hit["point_id"])]}
+            for hit in result.get("hits", [])
+            if str(hit.get("point_id")) in ui_refs
+        ]}
+    return response
 
 
 def _fetch_impl(ref_id: str, offset: int) -> dict:
@@ -574,11 +586,11 @@ WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint
 DELETE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 
 
-def _locked_search(query: str, options: dict | None = None, collection: str | None = None) -> dict:
+def _locked_search(query: str, options: dict | None = None, collection: str | None = None, *, include_ui: bool = False) -> dict:
     selected = _collection_name(collection) if collection else _selected_collection()
     token = _CALL_COLLECTION.set(selected)
     try:
-        return _search_impl(query, options)
+        return _search_impl(query, options, include_ui=include_ui)
     finally:
         _CALL_COLLECTION.reset(token)
 
@@ -1039,9 +1051,24 @@ def _ui_command(action: str, p: dict, budget: SearchCallBudget | None = None) ->
         token = _CALL_BUDGET.set(budget)
         try:
             return _locked_search(_ui_text(p, 'query'), options,
-                                  _collection_name(_ui_text(p, 'collection')))
+                                  _collection_name(_ui_text(p, 'collection')), include_ui=True)
         finally:
             _CALL_BUDGET.reset(token)
+    if action == 'ui.revisions':
+        from rag3.ingestion_jobs import change_versions, content_scope
+        collection = p.get('collection', '')
+        if not isinstance(collection, str):
+            raise ValueError('collection must be a string')
+        scopes = ['jobs', 'collections']
+        if collection:
+            scopes.append(content_scope(_collection_name(collection)))
+        return {'versions': change_versions(*scopes)}
+    if action == 'jobs.local_source':
+        from rag3.ingestion_jobs import one
+        # This command is reachable only over authenticated loopback UI API,
+        # never from the public MCP tool registration.
+        record = one(_ui_text(p, 'job_id'), private=True)
+        return {'job_id': record['job_id'], 'source': record.get('source') or ''}
     if action == 'jobs.health':
         from rag3.ingestion_manager import _BACKEND_SCHEDULER
         if _BACKEND_SCHEDULER is None:
@@ -1057,7 +1084,12 @@ def _ui_command(action: str, p: dict, budget: SearchCallBudget | None = None) ->
         offset = _ui_nonnegative_int(p, 'offset', 0)
         if not 1 <= limit <= 200:
             raise ValueError('limit must be 1..200')
-        return JOBS.list(collection, status, limit, offset)
+        include_hidden = p.get('include_hidden', True)
+        if type(include_hidden) is not bool:
+            raise ValueError('include_hidden must be a boolean')
+        from rag3.ingestion_jobs import list_jobs
+        return list_jobs(collection=collection, status=status, limit=limit,
+                         offset=offset, include_hidden=include_hidden)
     if action == 'jobs.status':
         return JOBS.status(_ui_text(p, 'job_id'))
     if action == 'jobs.submit':

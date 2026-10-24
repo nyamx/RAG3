@@ -17,11 +17,11 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
-from rag3.constants import DEFAULT_QDRANT_URL, ROOT, MCP_FILE_SUFFIXES, UTF8_TEXT_SUFFIXES
+from rag3.constants import DEFAULT_QDRANT_URL, ROOT, DATA_ROOT, MCP_FILE_SUFFIXES, UTF8_TEXT_SUFFIXES
 from rag3.attachments import (AttachmentCancelled, download_attachment,
                               validate_filename, validate_url)
 
-JOB_ROOT = ROOT / "data" / "mcp_jobs"
+JOB_ROOT = DATA_ROOT / "mcp_jobs"
 MAX_TEXT_CHARS = 1_000_000
 ALLOWED_SUFFIXES = MCP_FILE_SUFFIXES
 ACTIVE = {"QUEUED", "DOWNLOADING", "RUNNING", "RESUMING", "PAUSING", "CANCELLING"}

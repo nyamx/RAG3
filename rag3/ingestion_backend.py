@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from rag3.constants import ROOT
+from rag3.constants import ROOT, DATA_ROOT
 from rag3.ingestion_manager import Scheduler, dispatch, JOB_ROOT, PORT as OLD_PORT
 from rag3.ingestion_jobs import (connect, one, patch, ingestion_progress,
                                  set_ingestion_progress, clear_ingestion_progress,
@@ -208,7 +208,7 @@ def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
     if any(n!=total for n in counts) or total<=0:
         raise RuntimeError(f'Qdrant source verification failed: expected {total}, got {counts}')
     return {'status':'COMPLETE','source_sha256':sha,'collection':collection,
-            'managed_source':str(ROOT/'data'/'sources'/sha/source.name),
+            'managed_source':str(DATA_ROOT/'sources'/sha/source.name),
             'documents_written':total,'bm25_vectors_written':counts[2],
             'source_point_count':counts[0],'source_dense_count':counts[1],
             'source_bm25_count':counts[2],
@@ -376,7 +376,7 @@ class BackendScheduler(Scheduler):
         self.active_id=job['job_id']
         try:
             # A previous pause marker is not a new request.
-            marker=ROOT/'data'/'checkpoints'/job['source_sha256']/'pause.request'
+            marker=DATA_ROOT/'checkpoints'/job['source_sha256']/'pause.request'
             marker.unlink(missing_ok=True)
             with connect() as db:
                 patch(db,job['job_id'],status='RESUMING' if job['mode']=='resume' else 'RUNNING',stage='Starting backend ingestion')
@@ -397,7 +397,7 @@ class BackendScheduler(Scheduler):
         if self._stop.is_set():
             return True
         status=one(job['job_id'],private=True)['status']
-        marker=ROOT/'data'/'checkpoints'/job['source_sha256']/'pause.request'
+        marker=DATA_ROOT/'checkpoints'/job['source_sha256']/'pause.request'
         return status in {'CANCELLING','PAUSING'} or marker.exists()
 
     def _terminate_parser(self, proc, parser_job):

@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from rag3.constants import DEFAULT_QDRANT_URL, ROOT
+from rag3.constants import DEFAULT_QDRANT_URL, ROOT, DATA_ROOT
 from rag3.ingestion_jobs import (ACTIVE, DB_PATH, TERMINAL, check_id,
                                  checkpoint_available, clear_ingestion_progress,
                                  connect, ingestion_progress, list_jobs, now, one, patch)
@@ -28,7 +28,7 @@ from rag3.ingestion_settings import progress_identity
 HOST, PORT = '127.0.0.1', int(os.environ.get('RAG3_INGESTION_MANAGER_PORT', '18747'))
 TOKEN_FILE = ROOT / 'data' / 'ingestion-manager.token'
 PROCESS_PYTHON = ROOT / '.venv' / 'Scripts' / 'pythonw.exe'
-JOB_ROOT = ROOT / 'data' / 'mcp_jobs'
+JOB_ROOT = DATA_ROOT / 'mcp_jobs'
 SUPPORTED_UI = {'.pdf','.doc','.docx','.md','.pptx','.xlsx','.html','.htm','.txt',
                 '.json','.jsonl','.csv','.tsv',
                 '.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
@@ -123,7 +123,7 @@ class Scheduler:
             job_folder = job_root / job['job_id']
             source = Path(original).resolve()
             managed = Path(managed_name).resolve()
-            expected_managed = (ROOT / 'data' / 'sources' / sha).resolve()
+            expected_managed = (DATA_ROOT / 'sources' / sha).resolve()
             if (source.parent != job_folder or managed.parent != expected_managed
                     or not managed.is_file() or self.digest(managed) != sha):
                 return
@@ -265,7 +265,7 @@ class Scheduler:
                     with connect() as db: patch(db,job_id,status='PAUSED',requested=0,stage='Queued (not yet started)')
                 elif status in {'RUNNING','RESUMING'} and job_id == self.active_id:
                     with connect() as db: patch(db,job_id,status='PAUSING',stage='Pause requested; waiting for checkpoint')
-                    marker = ROOT/'data'/'checkpoints'/job['source_sha256']/'pause.request'
+                    marker = DATA_ROOT/'checkpoints'/job['source_sha256']/'pause.request'
                     marker.parent.mkdir(parents=True,exist_ok=True)
                     marker.write_text('pause\n', encoding='utf-8')
                 else:
@@ -360,7 +360,7 @@ class Scheduler:
                    NUMEXPR_NUM_THREADS='2',TOKENIZERS_PARALLELISM='false',RAG3_WORKER_CPU_THREADS='2')
         python = str(PROCESS_PYTHON if PROCESS_PYTHON.exists() else sys.executable)
         # Remove stale markers before spawning; later Pause writes a fresh request.
-        (ROOT/'data'/'checkpoints'/job['source_sha256']/'pause.request').unlink(missing_ok=True)
+        (DATA_ROOT/'checkpoints'/job['source_sha256']/'pause.request').unlink(missing_ok=True)
         args = [python,str(ROOT/'scripts'/'ingest-worker.py'),job['source'],
                 '--collection',job['collection'],'--mode',job['mode'],
                 '--source-sha',job['source_sha256']]

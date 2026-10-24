@@ -27,7 +27,7 @@ from haystack_integrations.document_stores.qdrant.converters import (
 from qdrant_client import QdrantClient, models as qdrant_models
 
 from rag3.source_identity import sha256_file
-from rag3.constants import ROOT, DEFAULT_QDRANT_URL, DEFAULT_NATIVE_COLLECTION
+from rag3.constants import ROOT, DATA_ROOT, DEFAULT_QDRANT_URL, DEFAULT_NATIVE_COLLECTION
 from rag3.ingestion_settings import (
     BGE_BATCH_SIZE, DEFAULT_SPLIT_LENGTH, DEFAULT_SPLIT_OVERLAP,
     find_bge_m3 as find_local_bge_m3,
@@ -57,7 +57,7 @@ def preserve_source(source: str | Path, *, expected_sha256: str | None = None) -
     source_sha = expected_sha256 or sha256_file(src)
     if len(source_sha) != 64 or any(char not in "0123456789abcdef" for char in source_sha):
         raise ValueError("invalid source SHA-256")
-    dest_dir = ROOT / "data" / "sources" / source_sha
+    dest_dir = DATA_ROOT / "sources" / source_sha
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / src.name
 

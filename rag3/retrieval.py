@@ -189,17 +189,28 @@ def search(
             )
             for method in methods
         ]
+        # Native RRF may return equal-score points in a different order across
+        # otherwise identical requests. Retrieve the complete fusion candidate
+        # pool, break ties by stable Qdrant point ID, then apply final top_k.
+        # Sorting only the first top_k server results leaves cut-line ties unstable.
         response = client.query_points(
             collection_name=collection,
             prefetch=prefetch,
             query=qdrant_models.FusionQuery(fusion=qdrant_models.Fusion.RRF),
-            limit=top_k,
+            limit=effective_candidate_k * len(methods),
             with_payload=True,
             with_vectors=False,
         )
+        ordered_points = sorted(
+            response.points,
+            key=lambda point: (
+                -(float(point.score) if point.score is not None else float('-inf')),
+                str(point.id),
+            ),
+        )[:top_k]
         hits = [
             _point_to_hit(i + 1, point, "rrf")
-            for i, point in enumerate(response.points)
+            for i, point in enumerate(ordered_points)
         ]
         return {
             "query": query,
@@ -211,7 +222,10 @@ def search(
             "hits": hits,
         }
 
+    # Stage D: both UI and MCP consume the same first-occurrence union.
+    # Preserve individual method score/rank for presentation and diagnostics.
     hits: list[dict] = []
+    by_point: dict[str, dict] = {}
     for method in methods:
         query_value, vector_name = query_by_method[method]
         response = client.query_points(
@@ -223,10 +237,18 @@ def search(
             with_payload=True,
             with_vectors=False,
         )
-        hits.extend(
-            _point_to_hit(i + 1, point, method)
-            for i, point in enumerate(response.points)
-        )
+        for position, point in enumerate(response.points, 1):
+            key = str(point.id)
+            detail = {"retriever": method, "rank": position,
+                      "score": float(point.score) if point.score is not None else None}
+            existing = by_point.get(key)
+            if existing is not None:
+                existing["method_details"].append(detail)
+                continue
+            hit = _point_to_hit(len(hits) + 1, point, method)
+            hit["method_details"] = [detail]
+            by_point[key] = hit
+            hits.append(hit)
 
     return {
         "query": query,

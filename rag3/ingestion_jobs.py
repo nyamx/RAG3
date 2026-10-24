@@ -9,9 +9,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from rag3.constants import ROOT
+from rag3.constants import ROOT, DATA_ROOT
 
-DB_PATH = ROOT / 'data' / 'ingestion_jobs.sqlite'
+DB_PATH = DATA_ROOT / 'ingestion_jobs.sqlite'
 ACTIVE = frozenset({'QUEUED', 'DOWNLOADING', 'RUNNING', 'PAUSING', 'RESUMING', 'CANCELLING'})
 TERMINAL = frozenset({'COMPLETE', 'CANCELLED', 'FAILED'})
 

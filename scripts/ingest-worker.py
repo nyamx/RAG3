@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL
+from rag3.constants import DEFAULT_NATIVE_COLLECTION, DEFAULT_QDRANT_URL, DATA_ROOT
 from rag3.ingestion_settings import CHUNK_GROUP_SIZE, progress_identity
 from rag3.source_identity import sha256_file
 
@@ -25,7 +25,7 @@ def emit(kind: str, **payload) -> None:
 
 
 def pause_request_path(source_sha: str) -> Path:
-    return ROOT / "data" / "checkpoints" / source_sha / "pause.request"
+    return DATA_ROOT / "checkpoints" / source_sha / "pause.request"
 
 
 def pause_if_requested(source_sha: str) -> bool:
@@ -241,7 +241,7 @@ def embed_source(source: Path, collection: str, source_sha: str | None = None) -
     emit("log", message="STAGE qdrant PASS")
     return {
         "status": "COMPLETE", "source_sha256": source_sha,
-        "managed_source": str(ROOT / "data" / "sources" / source_sha / source.name),
+        "managed_source": str(DATA_ROOT / "sources" / source_sha / source.name),
         "collection": collection, "documents_written": total,
         "bm25_vectors_written": bm25_count,
         "source_point_count": source_count,
