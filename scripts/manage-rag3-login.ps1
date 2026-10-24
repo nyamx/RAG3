@@ -71,8 +71,20 @@ $cfg = [ordered]@{
     port = $port; qdrant_url = $qdrant; write_enabled = $write
     delete_enabled = $delete; bootstrap_infra = $bootstrapInfra; tunnel_autostart = $true
 }
+if ($env:RAG3_COLLECTION) {
+    if ($env:RAG3_COLLECTION -cnotmatch '^[\w][\w.-]{0,127}$') {
+        throw 'RAG3_COLLECTION is not a valid collection name'
+    }
+    $cfg['default_collection'] = $env:RAG3_COLLECTION
+}
 if (Test-Path -LiteralPath $config) {
     $old = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json
+    if ($null -ne $old.PSObject.Properties['default_collection'] -and -not $cfg.Contains('default_collection')) {
+        if ($old.default_collection -cnotmatch '^[\w][\w.-]{0,127}$') {
+            throw 'Existing default collection is invalid'
+        }
+        $cfg['default_collection'] = $old.default_collection
+    }
     if (($old | ConvertTo-Json -Compress) -ne (($cfg | ConvertTo-Json -Compress))) {
         throw 'Existing backend login config differs; refusing overwrite'
     }
@@ -87,6 +99,7 @@ if ($Operation -eq 'Plan') {
         port = $port; qdrant_url = $qdrant; write_enabled = $write
         delete_enabled = $delete; config_exists = (Test-Path -LiteralPath $config)
         task_user = $user
+        default_collection = $cfg['default_collection']
         backend_single_process = (IsExpectedTask $existing)
         after_upgrade_single_process = $true
     } | ConvertTo-Json -Compress

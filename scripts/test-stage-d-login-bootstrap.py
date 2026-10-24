@@ -12,11 +12,14 @@ spec.loader.exec_module(mod)
 base={'port':8000,'qdrant_url':'http://127.0.0.1:16333','write_enabled':True,
       'delete_enabled':True,'bootstrap_infra':True,'tunnel_autostart':True}
 assert mod.validate_config(base)==base
+assert mod.validate_config(dict(base,default_collection='rag3_main_20261020'))['default_collection']=='rag3_main_20261020'
 for invalid in [dict(base,port=True),dict(base,port=0),dict(base,port=65536),
                 dict(base,qdrant_url='http://user:secret@127.0.0.1:16333'),
                 dict(base,qdrant_url='http://127.0.0.1:16333/mcp'),
                 dict(base,qdrant_url='https://example.net:6333'),
-                dict(base,delete_enabled='1'),dict(base,unrecognized=True)]:
+                dict(base,delete_enabled='1'),dict(base,unrecognized=True),
+                dict(base,default_collection=''),dict(base,default_collection='../bad'),
+                dict(base,default_collection=17)]:
     try:mod.validate_config(invalid)
     except (ValueError,TypeError):pass
     else:raise AssertionError('Invalid config permitted')

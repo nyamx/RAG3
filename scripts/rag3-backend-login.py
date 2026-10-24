@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -27,11 +28,12 @@ TUNNEL = ROOT / 'scripts' / 'rag3-tunnel-autostart.py'
 LOG = ROOT / 'data' / 'logs' / 'shared-backend-login.log'
 REQUIRED = frozenset({'port', 'qdrant_url', 'write_enabled', 'delete_enabled',
                       'bootstrap_infra', 'tunnel_autostart'})
+OPTIONAL = frozenset({'default_collection'})
 
 
 def validate_config(value: object) -> dict:
-    if not isinstance(value, dict) or set(value) != REQUIRED:
-        raise ValueError('Expected exactly the documented backend-login fields')
+    if not isinstance(value, dict) or not REQUIRED <= set(value) or set(value) - REQUIRED - OPTIONAL:
+        raise ValueError('Expected only the documented backend-login fields')
     port = value['port']
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError('Invalid port')
@@ -45,6 +47,9 @@ def validate_config(value: object) -> dict:
     for name in ('write_enabled', 'delete_enabled', 'bootstrap_infra', 'tunnel_autostart'):
         if type(value[name]) is not bool:
             raise ValueError(f'{name} must be a boolean')
+    if 'default_collection' in value and (not isinstance(value['default_collection'], str) or
+            re.fullmatch(r'[\w][\w.-]{0,127}', value['default_collection']) is None):
+        raise ValueError('Invalid default collection')
     # The bundled WSL Docker compose starts only the default local Qdrant service.
     if value['bootstrap_infra'] and (url.scheme, url.hostname, url.port) != (
             'http', '127.0.0.1', 16333):
@@ -112,6 +117,8 @@ def run_backend(cfg: dict) -> None:
         'RAG3_MCP_DELETE_ENABLED': '1' if cfg['delete_enabled'] else '0',
         'RAG3_PROJECT_ROOT': str(ROOT),
     })
+    if 'default_collection' in cfg:
+        os.environ['RAG3_COLLECTION'] = cfg['default_collection']
     # Test instances must keep logs inside isolated data roots.
     test_root = os.environ.get('RAG3_TEST_DATA_ROOT')
     log_path = (Path(test_root) / 'logs' / 'shared-backend-login.log'
