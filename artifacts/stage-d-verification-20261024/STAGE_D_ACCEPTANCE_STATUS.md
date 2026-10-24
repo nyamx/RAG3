@@ -39,4 +39,10 @@ No `Stage D PASS` claim until each required external and operational test is ver
 | Remote tunnel | This chat's connected RAG3 app returned a live five-collection list, shared job list, explicit semantic search and ordinary default-collection search (8 hits). Tunnel dispatch log grew for a connected call | Public URL and raw MCP initialization exchange were not separately captured; stateless remote selection requires a configured default or explicit collection |
 | Performance | Existing post-cutover BM25 12-sample median 173.0 ms, p95 22215.7 ms (cold outlier); operating private committed memory snapshot 5391.6 MiB; device-wide VRAM 2292/4096 MiB | Comparable precutover baseline, production throughput, process RSS/VRAM peaks remain unmeasured; no speedup assertion |
 
-Related commits: `21eeb99`, `bda6173`, `b4add1d`, `192d96d`, `51d9818`, `2cc346b`. The exact test scope and limitations are in `RAG3_SHARED_BACKEND_PROGRESS.md`. **Formal status remains PARTIAL** pending a genuine login test and an explicit decision on the irrecoverable precutover measurement criterion.
+Related commits: `21eeb99`, `bda6173`, `b4add1d`, `192d96d`, `51d9818`, `2cc346b`, `b73a67c`. The exact test scope and limitations are in `RAG3_SHARED_BACKEND_PROGRESS.md`.
+
+### Post-login update — 2026-10-24
+
+- Actual Windows sign-out and sign-in: **PASS**. `shutdown /l` returned successfully; the registered task's `LastRunTime` is 17:07:40 KST. It automatically started PID 14540 at 17:07:40.708 as `.venv\Scripts\rag3-pythonw-direct.exe`, directly under Task Scheduler's `svchost.exe`. One resident RAG3 Python PID, no legacy tray/worker; cold BGE load count 0.
+- Backend health ready, Qdrant transport reachable, operating SQLite `quick_check=ok` with the same 82 jobs and status counts. The saved tunnel helper logged `connected` at 17:09:29 KST; the chat's connected RAG3 app returned the five live collections and configured default after sign-in.
+- **Functional Stage D rollout verified.** The original formal acceptance checklist also requested a comparison with precutover performance measurements. Those were never recorded, so that criterion remains **unmeasured**. No full-scope Stage D PASS or performance improvement is asserted from post-cutover samples alone.

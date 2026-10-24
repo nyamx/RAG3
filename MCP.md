@@ -1,6 +1,6 @@
 # RAG3 shared HTTP/MCP backend
 
-**Stage D operational status (2026-10-24): PARTIAL.** Local backend, Qt UI, installed Codex HTTP plugin, the existing remote tunnel's read calls, and isolated fault recovery have passed. Actual Windows sign-out/sign-in and a comparable precutover performance baseline remain outstanding; see [RAG3_SHARED_BACKEND_PROGRESS.md](RAG3_SHARED_BACKEND_PROGRESS.md) and `STAGE_D_ACCEPTANCE_STATUS.md`.
+**Stage D operational status (2026-10-24): functional rollout verified; formal performance comparison incomplete.** Local backend, Qt UI, installed Codex HTTP plugin, the existing remote tunnel's read calls, isolated fault recovery, and actual Windows sign-out/sign-in have passed. A comparable precutover performance baseline was not recorded; see [RAG3_SHARED_BACKEND_PROGRESS.md](RAG3_SHARED_BACKEND_PROGRESS.md) and `STAGE_D_ACCEPTANCE_STATUS.md`.
 
 `scripts/rag3-mcp-server.py` hosts one persistent HTTP/MCP backend and the authenticated local UI command API. The backend, rather than Qt UI or stdio clients, owns job state, Qdrant access, retrieval, and the single CUDA BGE-M3 service. A temporary CPU parser child can appear during ingestion. Qdrant and the Secure MCP Tunnel runtime are separate services and are not included in the resident RAG3 Python backend count.
 
@@ -8,7 +8,7 @@ See [RAG3_PLUGIN_SETUP.md](RAG3_PLUGIN_SETUP.md) for Windows login registration,
 
 ## Starting and stopping on Windows
 
-On this PC, the user-scope Scheduled Task **`RAG3 Shared Backend`** launches `scripts/rag3-backend-login.py` through `.venv\Scripts\rag3-pythonw-direct.exe`. The direct executable uses the existing virtual environment without the stock Windows venv `pythonw.exe` redirector process. A manual task stop/start verified one backend Python PID; a real Windows sign-out/sign-in has not yet been verified. The login entry checks or starts local Qdrant when configured, then runs the HTTP/MCP backend in that same PID. Opening a UI window does not start the persistent backend. The saved, non-secret configuration is `data/backend-login-config.json`. `scripts/manage-rag3-login.ps1` supports `-Operation Inspect`, `Plan`, `Prepare`, `Upgrade`, and `Install`; `Install` registers a missing task, while `Upgrade` changes only a recognized legacy action. Neither is an arbitrary force-restart command.
+On this PC, the user-scope Scheduled Task **`RAG3 Shared Backend`** launches `scripts/rag3-backend-login.py` through `.venv\Scripts\rag3-pythonw-direct.exe`. The direct executable uses the existing virtual environment without the stock Windows venv `pythonw.exe` redirector process. After an actual Windows sign-out/sign-in on 2026-10-24, the task started at 17:07:40 KST with one backend Python PID, reachable Qdrant, and zero cold BGE loads; the saved tunnel reconnected at 17:09. The login entry checks or starts local Qdrant when configured, then runs the HTTP/MCP backend in that same PID. Opening a UI window does not start the persistent backend. The saved, non-secret configuration is `data/backend-login-config.json`. `scripts/manage-rag3-login.ps1` supports `-Operation Inspect`, `Plan`, `Prepare`, `Upgrade`, and `Install`; `Install` registers a missing task, while `Upgrade` changes only a recognized legacy action. Neither is an arbitrary force-restart command.
 
 ```powershell
 cd C:\python_program\RAG3
@@ -23,7 +23,7 @@ Get-ScheduledTask -TaskName 'RAG3 Shared Backend'
 
 `RAG3.exe` launches the PySide6 UI only; the launcher requires .NET 8 and the project virtual environment. A second launch focuses the current UI, and closing the UI does not terminate the backend or remote tunnel. Build with `scripts/build-launcher.ps1` when changing `launcher/Program.cs`. To verify the service, query `http://127.0.0.1:8000/health` and check the returned backend PID/ownership; a listening port alone is not proof that the correct backend owns it.
 
-The old `scripts/rag3-mcp-tray.py`, stdio server startup, and independent search/collection workers are **not part of the normal Stage D startup path**. Do not use the old tray menu to stop or restart the current service. Before any restart, inspect active ingestion/download jobs and the queue. To apply backend code/config changes, use the Scheduled Task owner and verify the same SQLite data, a rotated local API token, and the backend PID afterward. The task action alone does not prove the next logon or process-count acceptance test passed.
+The old `scripts/rag3-mcp-tray.py`, stdio server startup, and independent search/collection workers are **not part of the normal Stage D startup path**. Do not use the old tray menu to stop or restart the current service. Before any restart, inspect active ingestion/download jobs and the queue. To apply backend code/config changes, use the Scheduled Task owner and verify the same SQLite data, a rotated local API token, and the backend PID afterward.
 
 ## Local HTTP and authentication boundaries
 

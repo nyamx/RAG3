@@ -1,6 +1,6 @@
 # RAG3 연결 및 운영 가이드 — Stage D
 
-**출처 기준:** 2026-10-24 Stage D 구현·실환경 검증. **상태: PARTIAL.** 로컬 HTTP 백엔드, 실제 Qt UI, 설치된 Codex 플러그인, 기존 터널을 통한 연결 앱의 읽기·검색 호출 및 격리 장애 복구를 확인했다. 실제 Windows 재로그인과 전환 전후의 동등 조건 성능 비교는 남았다. 자세한 판정은 [RAG3_SHARED_BACKEND_PROGRESS.md](RAG3_SHARED_BACKEND_PROGRESS.md)와 `STAGE_D_ACCEPTANCE_STATUS.md`를 따른다.
+**출처 기준:** 2026-10-24 Stage D 구현·실환경 검증. **상태: 기능 전환 검증 완료, 성능 비교 미완료.** 로컬 HTTP 백엔드, 실제 Qt UI, 설치된 Codex 플러그인, 기존 터널을 통한 연결 앱의 읽기·검색 호출 및 격리 장애 복구를 확인했다. 실제 Windows 재로그인은 확인했고, 전환 전 동일 조건 성능 기준은 기록되지 않았다. 자세한 판정은 [RAG3_SHARED_BACKEND_PROGRESS.md](RAG3_SHARED_BACKEND_PROGRESS.md)와 `STAGE_D_ACCEPTANCE_STATUS.md`를 따른다.
 
 ## 연결 구조
 
@@ -32,7 +32,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\manage-rag3-logi
 Get-ScheduledTask -TaskName 'RAG3 Shared Backend'
 ```
 
-현재 PC의 등록 설정은 포트 `8000`, Qdrant `127.0.0.1:16333`, 쓰기·삭제 허용, MCP 기본 컬렉션 `rag3_main_20261020`이다. 예약 작업은 `.venv\Scripts\rag3-pythonw-direct.exe`를 실행하며 수동 stop/start에서 백엔드 Python PID 하나를 확인했다. 실제 로그아웃·재로그인 시험은 아직 남았다. 이 설정은 **원격 클라이언트별 정책이 아니라 공용 백엔드 전체 정책**이다. 정책 변경은 활성 작업 확인과 백엔드 재시작이 필요하며, UI만 재시작해서는 반영되지 않는다. 재시작 전에 DB 온라인 백업과 활성 적재·다운로드·GPU 큐 상태를 확인한다. `data/ingestion_jobs.sqlite`의 WAL DB를 파일 하나만 복사하지 않는다.
+현재 PC의 등록 설정은 포트 `8000`, Qdrant `127.0.0.1:16333`, 쓰기·삭제 허용, MCP 기본 컬렉션 `rag3_main_20261020`이다. 예약 작업은 `.venv\Scripts\rag3-pythonw-direct.exe`를 실행하며 실제 로그아웃·재로그인 후 17:07:40 KST 자동 기동된 백엔드 Python PID 하나, Qdrant 연결 및 BGE 지연 로드 0회를 확인했다. 이 설정은 **원격 클라이언트별 정책이 아니라 공용 백엔드 전체 정책**이다. 정책 변경은 활성 작업 확인과 백엔드 재시작이 필요하며, UI만 재시작해서는 반영되지 않는다. 재시작 전에 DB 온라인 백업과 활성 적재·다운로드·GPU 큐 상태를 확인한다. `data/ingestion_jobs.sqlite`의 WAL DB를 파일 하나만 복사하지 않는다.
 
 `RAG3.exe`는 UI만 실행한다. UI를 닫아도 백엔드 PID는 유지된다. 인증 UI API는 로컬 전용이며 백엔드가 발급한 포트별 토큰을 `X-RAG3-Token` 헤더로 전송한다. 토큰을 플러그인 manifest, URL, 로그, 터널 프로필에 복사하지 않는다. 백엔드가 내려가 있으면 UI에서 연결 실패로 보고하며 구 manager를 자동 기동하지 않는다.
 
@@ -83,4 +83,4 @@ UI와 MCP는 동일한 검색·작업·컬렉션 백엔드를 사용한다. BGE-
 
 ## 5. 남은 검증과 판정
 
-Stage D의 **PARTIAL** 판정은 현재 실제 측정 및 호출 범위를 반영한다. 남은 항목은 실제 Windows 로그아웃/로그인 후 기동과 전환 이전·이후 동일 조건의 성능 비교다. 백엔드 중단·Qdrant/CUDA 장애 복구와 늦은 쓰기 대조는 격리된 실제 HTTP 백엔드에서 확인했으며 운영 DB·컬렉션에는 장애를 주입하지 않았다. 최초 CUDA 로딩 및 일부 검색 시간은 측정했지만 전체 자원·처리량과 신뢰할 수 있는 이전 기준선은 미측정이다. 구현·검증 로그와 백업 위치는 `RAG3_SHARED_BACKEND_PROGRESS.md`에 남긴다.
+Stage D 기능 전환은 실제 Windows 재로그인 후 자동 기동까지 확인했다. 전환 이전·이후 동일 조건 성능 비교는 전환 전 기준이 없어 미완료다. 백엔드 중단·Qdrant/CUDA 장애 복구와 늦은 쓰기 대조는 격리된 실제 HTTP 백엔드에서 확인했으며 운영 DB·컬렉션에는 장애를 주입하지 않았다. 최초 CUDA 로딩 및 일부 검색 시간은 측정했지만 전체 자원·처리량과 신뢰할 수 있는 이전 기준선은 미측정이다. 구현·검증 로그와 백업 위치는 `RAG3_SHARED_BACKEND_PROGRESS.md`에 남긴다.
