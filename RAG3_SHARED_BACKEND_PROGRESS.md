@@ -178,3 +178,31 @@ Baseline: `codex/shared-backend`, HEAD before work `e886e04`. Existing untracked
 - To give a same-PC reference without mutating data, the retained pre-Stage-D UI process entry `scripts/retrieval-worker.py` was run as a new Python process per query against the existing `rag3_main_20261020` collection. The deployed backend was called via its authenticated loopback HTTP API with the same query, method and `top_k=8`. Both paths returned eight semantic hits. The worker file itself is unchanged since the pre-D revision; current retrieval code differs in RRF tie order and nonfused deduplication, while the tested single-method model/lookup path remains the same.
 - Semantic-only wall time including startup: one legacy cold request **47.40 s**; backend cold request **32.11 s**; five backend warm requests **0.281–0.402 s**, median **0.328 s**. Backend model load count stayed at **1**. BM25-only, five calls each: legacy new-process median **25.150 s** (nearest-rank p95 **26.703 s**); persistent backend median **0.158 s** (nearest-rank p95 **0.243 s**). Raw samples and conditions are in `artifacts/stage-d-verification-20261024/legacy-path-reconstruction-20261024.json`.
 - These are **reconstructed current-day reference runs**, not measurements captured before the actual cutover. Runs were sequential; Qdrant cache order was not randomized, semantic legacy has only one sample, and BM25 p95 with five samples is not a capacity estimate. Ingestion throughput and resource peaks remain unmeasured. The read-only run left backend PID 14540 and all 82 operating jobs unchanged with SQLite `quick_check=ok`; no speedup percentage or formal historical before/after PASS is claimed.
+
+## Persistent CPU parser — final evidence matrix (2026-10-24 KST)
+
+Functional cutover **PASS** at source commit `dcce995`. The operational backend was restarted once after an online SQLite backup, and the new parser served two distinct temporary documents without changing PID. Detailed, local-only evidence: `artifacts/analysis/persistent-parser/closeout-result-20261024.json`. Earlier evidence remains in the same folder; the 21:54 partial matrix is superseded by this table.
+
+| 기존 17항목 | 판정 | 확인 근거 |
+| --- | --- | --- |
+| 콜드 기동 | PASS | 운영 `/health`: backend `57884`, parser `74908` ready, BGE cold load count 0 before first ingest. |
+| 실제 형식 전환 | PASS | 이전 PDF↔DOCX 반복 및 PPTX/XLSX/HTML/MD/CSV/PNG 격리 적재; 운영 DOCX→PDF 완료와 파서 PID 유지. `actual-format-sequence-20261024_10.json`, `remaining-docling-formats-20261024-46.json` |
+| 평문 경로 | PASS | TXT/JSON/JSONL/TSV/CSV 격리 적재. `plain-backend-isolated-20261024-47.json` |
+| GPU 격리 | PASS | 파서는 CPU 전용 자식, 운영 BGE는 콜드 0회에서 문서 임베딩 후 1회 로드; BM25 검색은 추가 로드 없음. CUDA 할당량의 장기 계측은 별도 관찰. |
+| import 격리 | PASS | 백엔드 검색 후 Docling import 없음. `live-search-latency-20261024-43.json` |
+| Qdrant 재사용 | PASS | 같은 클라이언트로 별도 서버 중단 감지·복구 확인. 호환성 HTTP 호출 수는 미계측. `test-closeout-qdrant-reconnect.py` |
+| BM25 설정 | PASS | 실서버 검색 및 외부 설정 변경 회귀. `bm25-external-config-20261024-50.json` |
+| 원본 검증 | PASS | 원본 잠금·해시 반복 제거 격리 검증. 시작 시 전체 SHA는 신규 2회, Resume 3회 남음. `performance-contract-20261024-42.json` |
+| DOC 변환 | PASS | Word COM 기반 DOC→DOCX 격리 시험. `doc-com-isolated-20261024-45.json` |
+| SQLite | PASS | 빈 DB 및 구형 인덱스 DB 각각 6개 프로세스 동시 준비, `quick_check=ok`; 구형 인덱스 조건 복구. `test-closeout-sqlite-multiprocess.py` |
+| 평문 청커 | PASS | 기존 분할 결과 동등성과 검증 형식 확인. `performance-contract-20261024-42.json`, `plain-backend-isolated-20261024-47.json` |
+| 동시 사용 | PASS | 파서 busy 중 BM25 12건 격리 및 운영 PDF 파싱 중 HTTP/MCP 검색 각각 1건, Qt UI 검색 1건. `parser-busy-search-20261024-48.json` |
+| 취소·장애 | PASS | 결과와 Pause 경합 정리, 재기동 EOF 및 복구 실패 자식 회수; 실제 스케줄러 Cancel과 지연 Qdrant upsert 경합. `test-closeout-lifecycle.py`, `test-closeout-scheduler-cancel.py` |
+| 부분 기록 재개 | PASS | 실 Qdrant 임시 ready 포인트에 대한 Resume/Restart 거부 및 포인트 보존. `test-closeout-scheduler-cancel.py`, `delayed-qdrant-upsert-resume-20261024-49.json` |
+| IPC·경합 | PASS | 동일 자식 연속 IPC와 프로토콜 복구; 늦은 EOF, Pause 결과 순서 제어. `parser-protocol-recovery-20261024-17.json`, `test-closeout-lifecycle.py` |
+| 재기동·연결 | PASS | 운영 통제 재시작 1회, 별도 Qdrant 중단·복구, 운영 파서 PID 안정. 새 코드의 Windows 재로그인은 별도 관찰. |
+| 자원·성능 | 측정 | 운영 파서 작업 집합 1690.3 MiB, private 2426.4 MiB; 이전 콜드 준비 37.90초 및 소형 PDF/DOCX 반복 수치. 장시간 32 GiB 시스템 부하와 정확한 처리량 개선율은 미측정. |
+
+운영 보존: 재시작 전 SQLite 온라인 백업 `artifacts/backups/persistent-parser-closeout-20261024_225253/ingestion_jobs.sqlite`의 `quick_check=ok`. 임시 적재 작업 4건과 임시 컬렉션을 제거한 뒤 원래 작업 82건의 ID·상태가 백업과 같고, 운영 Qdrant 다섯 컬렉션도 시작 시점과 같다. 최종 `/health.cpu_parser`는 PID `74908`, `ready=true`, `restart_count=0`; backend PID `57884`; BGE load count 1 (문서 임베딩 뒤).
+
+별도 운영 관찰: 장시간 파서+BGE 부하·스왑, 실제 처리량 개선율, 새 코드 배포 후 Windows 로그아웃/로그인과 터널 복구. 이전 Stage D 버전의 실제 로그인 복구 증거는 있다. Python SQLite 3.40.1의 WAL 버전 위험과 런타임 업그레이드, 시작 시 남는 신규 2회/Resume 3회 전체 SHA 계산, Qdrant 호환성 HTTP 호출 수 계측은 별도 작업이다. 격리 성능 수치를 운영 용량 약속으로 해석하지 않는다.
