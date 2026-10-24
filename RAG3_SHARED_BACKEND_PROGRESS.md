@@ -139,3 +139,10 @@ Baseline: `codex/shared-backend`, HEAD before work `e886e04`. Existing untracked
 - MCP and authenticated HTTP searches now pass the outer 90-second request deadline into each GPU query (with a 0.25-second margin), cancel waiting GPU requests when their client times out or disconnects, and return bounded GPU failure codes without internal error text. A clean HTTP backend exit calls `scheduler.stop()`.
 - Isolated regression results: Stage C hardening 8/8; Windows parser Job Object 3/3, including a child-created grandchild; search budget 5/5; original Stage C isolated 7/7 and lifecycle 4/4; Stage B deterministic GPU 21/21; Stage A fake-Qdrant HTTP E2E PASS. The actual GPU model, live Qdrant and desktop UI were not rerun for this hardening pass; Stage D still owns UI/plugin parity.
 - A Qdrant request already sent by the CPU parser when termination begins may finish at the server. Such an in-flight write is treated as non-preemptible; cancellation prevents later backend batches and keeps checkpoint/point state available for an explicit Resume or Restart decision.
+
+<!-- STAGE_D_RUNTIME_EVIDENCE_20261024 -->
+### Stage D deployment/acceptance checkpoint — 2026-10-24 13:25:28 KST
+
+**PARTIAL, NOT FINAL PASS.** Operational SQLite: `quick_check=ok`, jobs **82**, active **0** at record time. HTTP backend and Qt UI were exercised; installed Codex HTTP MCP plugin `0.1.2` was exercised in a new Codex task. Actual semantic/RRF/nonfused UI↔MCP search parity **7/7**, single GPU BGE load **1**, RRF stable tie-break and 5/5 offline acceptance tests PASS. Live backend was restarted safely (PID `18140` to `22688`) with token rotation; process/DB preservation checked. The exact evidence and unresolved conditions are documented in `artifacts/stage-d-verification-20261024/STAGE_D_ACCEPTANCE_STATUS.md`.
+
+**Do not declare Stage D complete:** remote tunnel external MCP E2E and post-restart reconnect, genuine Windows relogin, full live failure-recovery matrix, precutover performance/resource baseline and deployment cleanup remain unverified. A ChatGPT RAG3 tool response does not alone establish that the response traversed the saved Secure MCP Tunnel.
