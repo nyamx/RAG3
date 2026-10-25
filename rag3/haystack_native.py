@@ -439,7 +439,10 @@ def build_parsing_pipeline(
     *, split_length: int = DEFAULT_SPLIT_LENGTH,
     split_overlap: int = DEFAULT_SPLIT_OVERLAP,
     pdf_cpu: bool = False,
+    pdf_cuda: bool = False,
 ) -> Pipeline:
+    if pdf_cpu and pdf_cuda:
+        raise ValueError('Select only one PDF accelerator')
     pdf_options = PdfPipelineOptions()
     if hasattr(pdf_options, "do_ocr"):
         pdf_options.do_ocr = True
@@ -462,6 +465,9 @@ def build_parsing_pipeline(
         pdf_options.queue_max_size = 8
     if pdf_cpu:
         pdf_options.accelerator_options.device = AcceleratorDevice.CPU
+        pdf_options.accelerator_options.num_threads = 2
+    elif pdf_cuda:
+        pdf_options.accelerator_options.device = AcceleratorDevice.CUDA
         pdf_options.accelerator_options.num_threads = 2
     if hasattr(pdf_options, "artifacts_path"):
         pdf_options.artifacts_path = DEFAULT_DOCLING_MODEL_DIR

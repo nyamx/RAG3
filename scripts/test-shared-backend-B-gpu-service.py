@@ -40,6 +40,60 @@ class Blocker:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_parser_reservation_unloads_and_reloads_model(self):
+        created, destroyed, cleared = [], [], []
+
+        class Model:
+            def __del__(self):
+                destroyed.append(1)
+
+        def factory():
+            created.append(1)
+            return Model()
+
+        s = GPUModelService(model_factory=factory,
+                            encode_fn=lambda _model, texts, **_: [[1.0] for _ in texts],
+                            cuda_cache_clear=lambda: cleared.append(1))
+        try:
+            self.assertEqual(s.submit_query('before').result(timeout=3), [1.0])
+            s.reserve_for_parsing(timeout=3)
+            self.assertEqual(s.snapshot()['state'], 'reserved_for_parsing')
+            self.assertEqual(len(destroyed), 1)
+            self.assertEqual(cleared, [1])
+            with self.assertRaisesRegex(GPUServiceError, 'GPU_RESERVED_FOR_PARSING'):
+                s.submit_query('during')
+            s.release_after_parsing()
+            self.assertEqual(s.submit_query('after').result(timeout=3), [1.0])
+            self.assertEqual(len(created), 2)
+        finally:
+            s.release_after_parsing()
+            s.close()
+
+    def test_parser_reservation_waits_for_active_cuda_call(self):
+        blocker = Blocker()
+        s = GPUModelService(model_factory=lambda: object(), encode_fn=blocker,
+                            cuda_cache_clear=lambda: None)
+        result = []
+        try:
+            active = s.submit_query('active')
+            self.assertTrue(blocker.entered.wait(2))
+            parked = threading.Thread(target=lambda: (s.reserve_for_parsing(timeout=3),
+                                                       result.append('parked')))
+            parked.start()
+            parked.join(.05)
+            self.assertTrue(parked.is_alive())
+            with self.assertRaisesRegex(GPUServiceError, 'GPU_RESERVED_FOR_PARSING'):
+                s.submit_query('late')
+            blocker.release.set()
+            parked.join(3)
+            self.assertEqual(result, ['parked'])
+            self.assertEqual(s.snapshot()['state'], 'reserved_for_parsing')
+            self.assertEqual(active.result(timeout=3), [6.0])
+        finally:
+            blocker.release.set()
+            s.release_after_parsing()
+            s.close()
+
     def test_cold_creation_and_same_model_owner(self):
         modules_before = {x for x in sys.modules if x.split('.')[0] in
                           ('torch', 'FlagEmbedding', 'docling')}

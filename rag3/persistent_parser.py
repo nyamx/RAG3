@@ -1,4 +1,4 @@
-"""Backend-owned, single-generation CPU parser service.
+"""Backend-owned, single-generation Docling parser service.
 
 Only stdlib is imported in the backend. Docling stays inside ingest-worker.py.
 """
@@ -21,7 +21,11 @@ class ParserUnavailable(RuntimeError):
 
 
 class PersistentCPUParser:
-    def __init__(self, stage_callback=None, *, ready_timeout=240, parse_timeout=3600):
+    def __init__(self, stage_callback=None, *, ready_timeout=240, parse_timeout=3600,
+                 device='cpu'):
+        if device not in ('cpu', 'cuda'):
+            raise ValueError('parser device must be cpu or cuda')
+        self._device = device
         self._lock = threading.RLock()
         self._ready = threading.Event()
         self._done = threading.Event()
@@ -53,6 +57,7 @@ class PersistentCPUParser:
             proc = self._proc
             return {'state': self._state, 'pid': proc.pid if proc is not None and proc.poll() is None else None,
                     'ready': self._state in ('ready','busy'),
+                    'device': self._device,
                     'restart_count': self._restart_count, 'error_code': self._error,
                     'generation': self._generation,
                     'prepared_pipeline_count': len(set(self._prepared.values()))}
@@ -101,7 +106,9 @@ class PersistentCPUParser:
             self._prepared = {}
             self._fatal_initialization = False
         env = os.environ.copy()
-        env.update(CUDA_VISIBLE_DEVICES='-1', RAG3_PARSE_CPU_ONLY='1',
+        env.update(CUDA_VISIBLE_DEVICES='0' if self._device == 'cuda' else '-1',
+                   RAG3_PARSE_DEVICE=self._device,
+                   RAG3_PARSE_CPU_ONLY='1' if self._device == 'cpu' else '0',
                    OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2',
                    HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
         rfd, wfd = os.pipe()

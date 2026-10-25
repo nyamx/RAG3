@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import math
+import gc
 import threading
 import time
 from collections import deque
@@ -120,10 +121,12 @@ class GPUModelService:
     def __init__(self, config: GPUServiceConfig | None = None, *,
                  model_factory: Callable[[], object] | None = None,
                  encode_fn: Callable | None = None,
+                 cuda_cache_clear: Callable[[], None] | None = None,
                  monotonic: Callable[[], float] = time.monotonic):
         self.config = config or GPUServiceConfig()
         self._factory = model_factory or self._load_cuda_model
         self._encode_fn = encode_fn  # deferred import by owner thread by default
+        self._cuda_cache_clear = cuda_cache_clear or self._clear_cuda_cache
         self._clock = monotonic
         self._condition = threading.Condition()
         self._queries: deque[_Request] = deque()
@@ -142,6 +145,8 @@ class GPUModelService:
         self._error_code: str | None = None
         self._error_summary: str | None = None
         self._model = None
+        self._parse_reservation = False
+        self._parse_parked = False
         self._model_load_count = 0
         self._owner_thread_id: int | None = None
         self._load_seconds: float | None = None
@@ -159,7 +164,8 @@ class GPUModelService:
                         document_deferred=self._deferred_document is not None,
                         active_kind=self._current.kind if self._current else None,
                         error_code=self._error_code, error_summary=self._error_summary,
-                        model_load_count=self._model_load_count)
+                        model_load_count=self._model_load_count,
+                        parser_has_gpu=self._parse_parked)
 
     def metrics(self) -> dict:
         with self._condition:
@@ -171,6 +177,59 @@ class GPUModelService:
                         document_encode_seconds=self._doc_encode_seconds,
                         query_batches=self._query_batches,
                         document_batches=self._document_batches[:])
+
+    def reserve_for_parsing(self, *, timeout: float = 180.0) -> None:
+        """Drain the GPU owner and release BGE before a CUDA parser starts."""
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError('timeout must be finite and positive')
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            if self._stop or self._state == 'failed':
+                raise GPUServiceError('GPU_FAILED', 'GPU service cannot be reserved')
+            if self._parse_reservation:
+                raise GPUServiceError('GPU_RESERVED_FOR_PARSING', 'GPU is already reserved')
+            self._parse_reservation = True
+            error = GPUServiceError('GPU_RESERVED_FOR_PARSING', 'GPU is reserved for PDF parsing')
+            for req in tuple(self._queries) + tuple(self._documents):
+                if not req.future.done():
+                    req.future.set_exception(error)
+            if self._deferred_document and not self._deferred_document.future.done():
+                self._deferred_document.future.set_exception(error)
+            self._queries.clear()
+            self._documents.clear()
+            self._deferred_document = None
+            # Let one already-running CUDA batch finish before releasing BGE.
+            # No new request is accepted after the reservation starts.
+            if self._worker is None:
+                self._parse_parked = True
+                self._state = 'reserved_for_parsing'
+            self._condition.notify_all()
+            while not self._parse_parked and self._state != 'failed' and not self._stop:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # The caller must still invoke release_after_parsing in its
+                    # finally block; a late CUDA call can finish after timeout.
+                    raise GPUServiceError('GPU_RESERVATION_TIMEOUT', 'BGE did not release GPU in time')
+                self._condition.wait(remaining)
+            if self._state == 'failed' or self._stop:
+                raise GPUServiceError('GPU_FAILED', 'GPU service failed while reserving')
+
+    def release_after_parsing(self, *, timeout: float = 180.0) -> None:
+        """Permit the next semantic query or embedding to load BGE again."""
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            if not self._parse_reservation:
+                return
+            while not self._parse_parked and not self._stop and self._state != 'failed':
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GPUServiceError('GPU_RESERVATION_TIMEOUT', 'BGE release is still in progress')
+                self._condition.wait(remaining)
+            self._parse_reservation = False
+            self._parse_parked = False
+            if not self._stop and self._state != 'failed':
+                self._state = 'not_initialized'
+            self._condition.notify_all()
 
     def submit_query(self, text: str, *, deadline_seconds: float | None = None,
                      deadline_monotonic: float | None = None) -> GPURequest:
@@ -212,6 +271,9 @@ class GPUModelService:
             if self._state == 'failed':
                 raise GPUServiceError(self._error_code or 'GPU_FAILED',
                                       'GPU service is in failed state')
+            if self._parse_reservation:
+                raise GPUServiceError('GPU_RESERVED_FOR_PARSING',
+                                      'GPU is reserved for PDF parsing')
             if len(self._queries) + len(self._documents) >= self.config.queue_limit:
                 raise GPUServiceError('QUEUE_FULL', 'GPU request queue at capacity')
             if kind == 'query':
@@ -346,6 +408,11 @@ class GPUModelService:
             raise GPUServiceError('GPU_DEVICE_UNVERIFIED', 'BGE parameters are unavailable')
         return model
 
+    @staticmethod
+    def _clear_cuda_cache() -> None:
+        import torch
+        torch.cuda.empty_cache()
+
     def _load_if_needed(self):
         if self._model is not None:
             return self._model
@@ -413,26 +480,57 @@ class GPUModelService:
         self._owner_thread_id = threading.get_ident()
         burst = 0
         while True:
+            # Drop the previous request's local model reference before release.
+            model = None
             with self._condition:
                 self._prune_locked(self._clock())
                 while (not self._stop and not self._queries and not self._documents
-                       and not self._deferred_document and self._state != 'failed'):
+                       and not self._deferred_document and not self._parse_reservation
+                       and self._state != 'failed'):
                     self._condition.wait()
                     self._prune_locked(self._clock())
                 if self._stop or self._state == 'failed':
                     return
-                if self._reset_query_burst:
-                    burst = 0
-                    self._reset_query_burst = False
-                req, burst = self._choose_locked(burst)
-                self._current = req
-                # set_running occurs only on the first batch. Cooperative cancel
-                # works independently of Future.cancel once running.
-                if req.offset == 0 and not req.future.set_running_or_notify_cancel():
-                    self._current = None
-                    continue
-                now = self._clock()
-                self._queue_wait_seconds += now - req.last_queued
+                if self._parse_reservation:
+                    if not self._parse_parked:
+                        old_model = self._model
+                        self._model = None
+                        self._state = 'releasing_for_parsing'
+                    else:
+                        self._condition.wait()
+                        continue
+                else:
+                    old_model = None
+                if self._parse_reservation:
+                    req = None
+                else:
+                    if self._reset_query_burst:
+                        burst = 0
+                        self._reset_query_burst = False
+                    req, burst = self._choose_locked(burst)
+                    self._current = req
+                    # set_running occurs only on the first batch. Cooperative cancel
+                    # works independently of Future.cancel once running.
+                    if req.offset == 0 and not req.future.set_running_or_notify_cancel():
+                        self._current = None
+                        continue
+                    now = self._clock()
+                    self._queue_wait_seconds += now - req.last_queued
+            if req is None:
+                try:
+                    if old_model is not None:
+                        del old_model
+                        gc.collect()
+                        self._cuda_cache_clear()
+                except BaseException:
+                    self._failure('GPU_RELEASE_FAILED', 'BGE release failed', None)
+                    return
+                with self._condition:
+                    if not self._stop:
+                        self._parse_parked = True
+                        self._state = 'reserved_for_parsing'
+                    self._condition.notify_all()
+                continue
             if req.cancelled or self._clock() >= req.deadline:
                 self._finish_error(req, GPURequestCancelled() if req.cancelled else GPURequestExpired())
                 continue
@@ -474,9 +572,17 @@ class GPUModelService:
                 continue
             req.vectors.extend(result)
             req.offset += len(batch)
+            with self._condition:
+                parsing = self._parse_reservation
+            if parsing and req.kind == 'document' and req.offset < len(req.texts):
+                self._finish_error(req, GPUServiceError(
+                    'GPU_RESERVED_FOR_PARSING', 'GPU is reserved for PDF parsing'))
+                continue
             if req.offset < len(req.texts):
                 with self._condition:
                     if self._stop:
+                        req.cancelled = True
+                    elif self._parse_reservation:
                         req.cancelled = True
                     elif req.future.done() or req.cancelled or self._clock() >= req.deadline:
                         pass

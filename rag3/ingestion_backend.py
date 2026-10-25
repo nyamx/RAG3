@@ -1,4 +1,4 @@
-"""Backend-owned ingestion: event scheduler, CPU parser and shared BGE embedding.
+"""Backend-owned ingestion: CPU parser, exclusive CUDA PDF parser, and BGE embedding.
 
 One instance is installed only after the HTTP backend instance lock is held.
 No DB writes or model loading happen when this module is imported.
@@ -23,6 +23,24 @@ from rag3.ingestion_jobs import (connect, one, patch, ingestion_progress,
 from rag3.ingestion_settings import progress_identity
 from rag3.source_identity import sha256_file
 PLAIN_TEXT_SUFFIXES = frozenset({".txt", ".json", ".jsonl", ".tsv"})
+
+
+def _use_cuda_parser(source: str | Path) -> bool:
+    """Amortize CUDA parser startup on multi-page PDFs; retain fast CPU small jobs."""
+    source = Path(source)
+    if source.suffix.lower() != '.pdf':
+        return False
+    min_pages = int(os.environ.get('RAG3_CUDA_PARSE_MIN_PAGES', '8'))
+    if min_pages < 1:
+        raise ValueError('RAG3_CUDA_PARSE_MIN_PAGES must be positive')
+    if min_pages == 1:
+        return True
+    from pypdfium2 import PdfDocument
+    pdf = PdfDocument(str(source))
+    try:
+        return len(pdf) >= min_pages
+    finally:
+        pdf.close()
 
 
 def _source_filter(sha: str, state: str | None = None):
@@ -163,6 +181,8 @@ def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
     source,collection,sha=Path(job['source']),job['collection'],job['source_sha256']
     c=_client(url)
     cfg=_bm25_config(c,collection)
+    completed=c.count(collection_name=collection,
+                      count_filter=_source_filter(sha,'ready'),exact=True).count
     while True:
         if should_stop():
             return {'status':'PAUSED'}
@@ -205,7 +225,8 @@ def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
             c.upsert(collection_name=collection,points=ready,wait=True)
         elif not commit_batch(c, collection, ready):
             return {'status':'PAUSED'}
-        emit(f'STAGE embedding {len(ready)} written')
+        completed += len(ready)
+        emit(f'STAGE embedding {completed}/{progress["total_chunks"]} written')
     progress=_compatible(job,url=url,check_qdrant=False,source_guard=source_guard)
     total=progress['total_chunks']
     counts=_source_counts(c,collection,sha)
@@ -264,6 +285,7 @@ class BackendScheduler(Scheduler):
         self._parser_job=None
         from rag3.persistent_parser import PersistentCPUParser
         self._persistent_parser = PersistentCPUParser(self._parser_stage)
+        self._gpu_parser = None  # CUDA child exists only while a PDF is parsed.
 
     def boot(self):
         if self._started:
@@ -366,6 +388,8 @@ class BackendScheduler(Scheduler):
                 if self._gpu_request is not None:
                     self._gpu_request.cancel()
                 self._persistent_parser.cancel(job_id)
+                if self._gpu_parser is not None:
+                    self._gpu_parser.cancel(job_id)
                 self._wake.set()
                 return one(job_id)
             value=super().action(job_id,operation)
@@ -449,7 +473,11 @@ class BackendScheduler(Scheduler):
         self.kill_worker(proc)
 
     def parser_snapshot(self):
-        return self._persistent_parser.snapshot()
+        snapshot = self._persistent_parser.snapshot()
+        with self.lock:
+            gpu_parser = self._gpu_parser
+        snapshot['cuda_parser'] = gpu_parser.snapshot() if gpu_parser is not None else None
+        return snapshot
 
     def _parser_stage(self,job_id,message):
         # The callback runs on the protocol reader. Do not write a cancelled
@@ -462,6 +490,31 @@ class BackendScheduler(Scheduler):
         if self._stopping(job):
             return {'status':'PAUSED'}
         return self._persistent_parser.parse(job, cancelled=lambda:self._stopping(job))
+
+    def _parse_cuda(self, job):
+        """Give CUDA to one short-lived PDF parser, then return it to BGE."""
+        from rag3.persistent_parser import PersistentCPUParser
+
+        parser = None
+        self._stage(job, 'STAGE GPU release BGE')
+        try:
+            self.gpu.reserve_for_parsing()
+            if self._stopping(job):
+                return {'status': 'PAUSED'}
+            parser = PersistentCPUParser(self._parser_stage, device='cuda')
+            with self.lock:
+                self._gpu_parser = parser
+            self._stage(job, 'STAGE CUDA parse RUN')
+            parser.start()
+            return parser.parse(job, cancelled=lambda:self._stopping(job))
+        finally:
+            try:
+                if parser is not None:
+                    parser.stop()  # The CUDA context must exit before BGE reloads.
+            finally:
+                with self.lock:
+                    self._gpu_parser = None
+                self.gpu.release_after_parsing()
 
     def _stage(self,job,message):
         with connect() as db: patch(db,job['job_id'],stage=message)
@@ -494,6 +547,8 @@ class BackendScheduler(Scheduler):
     def _execute(self,job):
         from rag3.source_guard import OriginalSourceGuard
         result=None; error=None; completed=False; source_guard=None
+        job_started=time.perf_counter()
+        parse_elapsed=None; parser_detail={}
         try:
             source_guard=OriginalSourceGuard(job['source'], job['source_sha256'])
             sha,collection=job['source_sha256'],job['collection']
@@ -509,6 +564,7 @@ class BackendScheduler(Scheduler):
                 set_ingestion_progress(collection,sha,progress_identity(sha,collection),'PARSING')
                 progress=ingestion_progress(collection,sha)
             if progress['phase']=='PARSING' and not self._stopping(job):
+                parse_started=time.perf_counter()
                 self._stage(job,'STAGE parse RUN')
                 if Path(job['source']).suffix.lower() in PLAIN_TEXT_SUFFIXES:
                     _stage_plain(Path(job['source']),collection,sha,progress,
@@ -516,10 +572,15 @@ class BackendScheduler(Scheduler):
                                  commit_batch=lambda client,collection,points:
                                      self._commit_batch(job,client,collection,points))
                 else:
-                    parsed=self._parse_cpu(job)
+                    parsed=(self._parse_cuda(job) if _use_cuda_parser(job['source'])
+                            else self._parse_cpu(job))
+                    parser_detail={key:parsed[key] for key in ('conversion_seconds','chunk_stage_seconds')
+                                   if key in parsed}
                     if not self._stopping(job):
                         _verify_reparsed_points(_client(self.qdrant_url),collection,sha,parsed)
+                parse_elapsed=round(time.perf_counter()-parse_started,3)
             if not self._stopping(job):
+                embed_started=time.perf_counter()
                 self._stage(job,'STAGE embedding RUN')
                 result=_embed_source(job,self.gpu,lambda:self._stopping(job),
                                      lambda msg:self._stage(job,msg),self.qdrant_url,
@@ -528,6 +589,13 @@ class BackendScheduler(Scheduler):
                                      commit_batch=lambda client,collection,points:
                                          self._commit_batch(job,client,collection,points))
                 completed=result.get('status')=='COMPLETE'
+                if completed:
+                    result['timings']={
+                        'parse_phase_seconds':parse_elapsed,
+                        'embedding_phase_seconds':round(time.perf_counter()-embed_started,3),
+                        'total_seconds':round(time.perf_counter()-job_started,3),
+                        **parser_detail,
+                    }
         except Exception as exc:
             error=f'{type(exc).__name__}: {exc}'[:400]
         finally:
@@ -574,4 +642,7 @@ class BackendScheduler(Scheduler):
                     pass  # Startup recovery will reconcile the unchanged journal.
             if self._gpu_request is not None:
                 self._gpu_request.cancel()
-            self._persistent_parser.stop()
+            gpu_parser = self._gpu_parser
+        self._persistent_parser.stop()
+        if gpu_parser is not None:
+            gpu_parser.stop()

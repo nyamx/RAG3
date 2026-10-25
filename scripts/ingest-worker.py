@@ -1,4 +1,4 @@
-"""Legacy document worker; the shared backend uses its CPU parse phase."""
+"""Document worker and isolated CPU/CUDA parser service for the shared backend."""
 
 from __future__ import annotations
 
@@ -128,17 +128,20 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None,
 
     if pause_if_requested(source_sha):
         return {"status": "PAUSED", "source_sha256": source_sha}
+    conversion_started = time.perf_counter()
     if source.suffix.lower() in PLAIN_TEXT_SUFFIXES:
         chunks = split_plain_text_source(preserved, base_meta)
     else:
         docling_source = prepare_docling_source(preserved)
-        # Child parser is CPU-only; it must never initialize CUDA/OCR on GPU.
+        # The shared backend explicitly selects CPU or CUDA for its child parser.
         pipeline = parsing_pipeline if parsing_pipeline is not None else build_parsing_pipeline(pdf_cpu=True)
         parsed = pipeline.run({"converter": {
             "sources": [str(docling_source)], "meta": base_meta,
         }})
         chunks = parsed["splitter"]["documents"]
+    conversion_seconds = time.perf_counter() - conversion_started
     total = len(chunks)
+    stage_started = time.perf_counter()
     if not stage(chunks, 0):
         return {"status": "PAUSED", "source_sha256": source_sha}
     # The field name remains stable for the existing parser-service protocol;
@@ -153,7 +156,9 @@ def parse_source(source: Path, collection: str, source_sha: str | None = None,
     emit("log", message="STAGE chunk PASS")
     emit("log", message="STAGE qdrant PASS")
     return {"status": "PARSED", "source_sha256": source_sha,
-            "total_chunks": total, "chunk_ids_sha256": digest}
+            "total_chunks": total, "chunk_ids_sha256": digest,
+            "conversion_seconds": round(conversion_seconds, 3),
+            "chunk_stage_seconds": round(time.perf_counter() - stage_started, 3)}
 
 
 def verify_source(client, collection: str, source_sha: str) -> tuple[int, int, int, int]:
@@ -205,7 +210,9 @@ def embed_source(source: Path, collection: str, source_sha: str | None = None) -
     bm25_config = collection_bm25_config(collection, url=url)
     embedder = BGEM3OnePassEmbedder(model_path=identity["embedding_model"])
     emit("log", message="STAGE embedding RUN")
-    completed = 0
+    completed = client.count(collection_name=collection,
+                             count_filter=source_filter(source_sha, phase="ready"),
+                             exact=True).count
     while True:
         if pause_if_requested(source_sha):
             return {"status": "PAUSED", "source_sha256": source_sha}
@@ -245,7 +252,7 @@ def embed_source(source: Path, collection: str, source_sha: str | None = None) -
             wait=True,
         )
         completed += len(points)
-        emit("log", message=f"STAGE embedding {completed} written")
+        emit("log", message=f"STAGE embedding {completed}/{total} written")
         del points, texts, vectors, updates
 
     source_count, dense_count, bm25_count, ready_count = verify_source(
@@ -339,11 +346,18 @@ def run_job(source: Path, collection: str, mode: str,
 
 
 def parser_service():
-    """One CPU-only converter, many serial requests, dedicated response pipe."""
+    """One isolated converter with a dedicated response pipe."""
     global _SERVICE_WRITER, _ACTIVE_REQUEST_ID
     import re
-    if os.environ.get('RAG3_PARSE_CPU_ONLY') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != '-1':
-        raise RuntimeError('CPU parser isolation not enabled')
+    device = os.environ.get('RAG3_PARSE_DEVICE', 'cpu')
+    if device == 'cpu':
+        if os.environ.get('RAG3_PARSE_CPU_ONLY') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != '-1':
+            raise RuntimeError('CPU parser isolation not enabled')
+    elif device == 'cuda':
+        if os.environ.get('CUDA_VISIBLE_DEVICES') != '0':
+            raise RuntimeError('CUDA parser isolation not enabled')
+    else:
+        raise RuntimeError('invalid parser device')
     if os.environ.get('RAG3_PARSE_PARENT_GATE') == '1' and sys.stdin.read(1) != 'G':
         raise RuntimeError('CPU parser parent gate closed')
     if os.name == 'nt':
@@ -358,7 +372,7 @@ def parser_service():
     from qdrant_client import QdrantClient
 
     try:
-        pipeline = build_parsing_pipeline(pdf_cpu=True)
+        pipeline = build_parsing_pipeline(pdf_cpu=device == 'cpu', pdf_cuda=device == 'cuda')
         converter = pipeline._rag3_docling_converter
         requested = {
             'pdf': 'PDF', 'image': 'IMAGE', 'docx': 'DOCX', 'pptx': 'PPTX',

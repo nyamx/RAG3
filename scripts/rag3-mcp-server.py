@@ -365,6 +365,7 @@ _GPU_SEARCH_ERRORS = {
     "GPU_DEVICE_UNVERIFIED": ("GPU_DEVICE_UNVERIFIED", "GPU model device could not be verified.", False),
     "GPU_FAILED": ("GPU_FAILED", "GPU search service failed.", False),
     "SERVICE_STOPPED": ("GPU_SERVICE_STOPPED", "GPU search service is stopped.", True),
+    "GPU_RESERVED_FOR_PARSING": ("GPU_RESERVED_FOR_PARSING", "GPU is parsing a PDF; BM25 search remains available.", True),
 }
 
 
