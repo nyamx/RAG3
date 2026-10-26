@@ -6,6 +6,8 @@ This repository contains the indexing and retrieval service. Model weights, pers
 
 **ChatGPT on the web can search your RAG3 collections.** Run RAG3 on your Windows PC, connect its local MCP endpoint through [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and install the resulting custom MCP plugin in ChatGPT. This path was exercised on the development PC. Each installation needs its own tunnel and ChatGPT workspace access; cloning this repository alone does not connect ChatGPT. See [MCP setup](docs/usage.md#chatgpt-on-the-web).
 
+**Original-file handoff has a measured boundary.** Experiments uploaded a PDF from RAG3 to ChatGPT host storage and downloaded matching bytes, but did not register it as an attachment in the current conversation or establish native PDF reading by the AI. Use RAG3 search, chunk reads, and page images when asking ChatGPT about indexed documents. The [experiment record](docs/chatgpt-file-handoff.md) separates the observed results from untested paths.
+
 ## Engineering highlights
 
 - **One backend for three clients.** The PySide6 UI, local Codex plugin, and ChatGPT web plugin use the same collections, ingestion jobs, and retrieval path. Closing the UI leaves the backend running.
@@ -14,16 +16,13 @@ This repository contains the indexing and retrieval service. Model weights, pers
 - **Inspectable retrieval.** BGE-M3 dense vectors and Qdrant's native BM25 sparse vectors support semantic, lexical, and reciprocal-rank-fusion search. Results retain source metadata and PDF page information when available.
 - **Format-aware parsing.** Docling handles PDF OCR and tables plus structured formats; plain text has a direct path. Legacy `.doc` conversion uses Microsoft Word when installed.
 
-```mermaid
-flowchart LR
-    UI[PySide6 desktop UI] --> API[Shared RAG3 backend]
-    CX[Codex local plugin] --> API
-    WEB[ChatGPT web] --> T[Secure MCP Tunnel] --> API
-    API --> J[SQLite job journal]
-    API --> P[Docling parser]
-    API --> E[BGE-M3 GPU service]
-    API --> Q[Qdrant dense + BM25]
-    API --> S[Managed source files]
+```text
+PySide6 desktop UI -------------------+
+Codex local MCP plugin ---------------+--> Shared RAG3 backend
+ChatGPT web --> Secure MCP Tunnel ----+      |-- SQLite job journal
+                                            |-- Docling parser and BGE-M3
+                                            |-- Qdrant dense and BM25 index
+                                            +-- managed source files
 ```
 
 The [architecture notes](docs/architecture.md) explain the data flow, GPU handoff, and retrieval behavior.

@@ -39,6 +39,8 @@ RAG3 was exercised from ChatGPT web through a custom MCP plugin and OpenAI Secur
 
 The repository's tunnel helper restores an existing local tunnel profile. It does not create another user's tunnel, key, or ChatGPT plugin. A local Codex plugin installation alone does not enable ChatGPT web access. Secure MCP Tunnel is for a private connection; publishing this GitHub source repository does not publish an MCP plugin to everyone.
 
+**Original PDF delivery to the AI:** `rag3_get_source` can provide a download card or source URI, but this does not make the PDF a native attachment in the current ChatGPT conversation. In the [October 2026 file-handoff experiments](chatgpt-file-handoff.md), a PDF reached ChatGPT host storage and was downloaded back with a matching SHA-256, yet the AI could not read it by the returned `fileId`. Use `rag3_search`, `rag3_get_document`, and `rag3_fetch` for text, or `rag3_get_page` for a page image. This limitation concerns RAG3-to-ChatGPT delivery; the separate `rag3_ingest_file` tool ingests an input file into RAG3 when an MCP client supplies a valid file reference.
+
 The main MCP tool groups are:
 
 | Task | Tools |
