@@ -2,6 +2,18 @@
 
 RAG3 is a Windows document indexing and retrieval system with a desktop UI, a shared HTTP backend, and MCP tools. It parses local files with Docling, indexes them in Qdrant, and searches with BGE-M3 semantic vectors, native BM25, or hybrid rank fusion.
 
+## Start here
+
+| I want to... | Open this guide |
+| --- | --- |
+| Install RAG3 and its Python, WSL2, Docker, Qdrant, and model dependencies | [Windows installation](docs/install-windows.md) |
+| Run the desktop UI or connect a local Codex / ChatGPT web MCP plugin | [Using RAG3](docs/usage.md) |
+| Follow a PDF-to-answer walkthrough and copy example prompts | [Worked examples](docs/examples.md) |
+| Understand the backend, indexing, and retrieval design | [Architecture](docs/architecture.md) |
+| Check measured behavior and known limits | [Verification](docs/verification.md) · [ChatGPT file-handoff experiments](docs/chatgpt-file-handoff.md) |
+
+**A typical run:** Create a collection named `demo` in the desktop UI, add a PDF, click **Run**, and wait for **COMPLETE**. Then search it in the UI or ask ChatGPT on the web through the installed RAG3 plugin: “Search my `demo` collection for the main findings, read the matching chunks, and include available source pages.” The [worked examples](docs/examples.md) show the exact steps and MCP calls.
+
 This repository contains the indexing and retrieval service. Model weights, personal documents, the Qdrant volume, and tunnel credentials are not part of the source tree.
 
 **ChatGPT on the web can search your RAG3 collections.** Run RAG3 on your Windows PC, connect its local MCP endpoint through [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and install the resulting custom MCP plugin in ChatGPT. This path was exercised on the development PC. Each installation needs its own tunnel and ChatGPT workspace access; cloning this repository alone does not connect ChatGPT. See [MCP setup](docs/usage.md#chatgpt-on-the-web).
@@ -55,10 +67,6 @@ In another window, open the UI:
 ```
 
 Create a collection, add a PDF, run its job, then search the collection. The backend also serves `http://127.0.0.1:8000/mcp` for local MCP clients. See [Using RAG3](docs/usage.md) for the UI and MCP paths.
-
-## Try it with a document
-
-After installation, use the desktop UI to create a collection named `demo`, add a PDF you are allowed to process, and click **Run**. When the job reaches **COMPLETE**, search for a term from that PDF. For an MCP client, ask it to search the `demo` collection and read the matching chunks before answering. The [worked examples](docs/examples.md) give copyable prompts for the desktop UI, local Codex, and ChatGPT on the web, plus the underlying tool calls.
 
 ## Verification and limits
 
