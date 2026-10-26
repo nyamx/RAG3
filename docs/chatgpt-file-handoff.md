@@ -4,9 +4,9 @@ This record describes **outbound** transfer of an original RAG3 file through MCP
 
 ## Evidence and conclusion
 
-The results below were reconstructed from RAG3 development conversations dated October 18–19, 2026. Some experiment logs survive only as summaries; the historical probe code was not rerun for this document. The observations apply to the tested ChatGPT and RAG3 setup, not to every possible MCP client or future ChatGPT release.
+The October 18–19 results below were reconstructed from RAG3 development conversations. Some experiment logs survive only as summaries; the historical probe code was not rerun for this document. The later Library UI search is a direct observation reported by the user on October 26, 2026. These results apply to the tested ChatGPT and RAG3 setup, not to every possible MCP client or future ChatGPT release.
 
-**Observed result:** RAG3 uploaded a PDF to ChatGPT host file storage, received a `fileId`, then downloaded the file back with a matching SHA-256. That file was **not registered as an attachment in the current conversation**. An attempted AI read using the returned `fileId` failed with a file-reference visibility error. Native whole-PDF reading by the AI was not demonstrated. There is no evidence that OpenAI intentionally blocks this handoff.
+**Observed result:** RAG3 uploaded a PDF to ChatGPT host file storage, received a `fileId`, then downloaded the file back with a matching SHA-256. `uploadFile(file, {library: true})` returned success, but a direct search in the ChatGPT Library UI did not find the file. That file was **not registered as an attachment in the current conversation**. An attempted AI read using the returned `fileId` failed with a file-reference visibility error. Native whole-PDF reading by the AI was not demonstrated. The observations do not distinguish failed internal Library registration from successful registration that was not exposed in the UI, and they do not establish intentional blocking by OpenAI.
 
 | Date | Experiment | Observation |
 | --- | --- | --- |
@@ -16,8 +16,9 @@ The results below were reconstructed from RAG3 development conversations dated O
 | Oct 18 | Call `getFileDownloadUrl()` and download the upload | Download succeeded; SHA-256 matched the original. |
 | Oct 18 | Have the AI read using the returned `fileId` | Failed with a file-reference visibility error. The file had not become a current-conversation attachment. |
 | Oct 18 | Upload a ZIP | Rejected as `Unsupported file type`. |
-| Oct 19 | Call `uploadFile(file, {library: true})` | Upload succeeded; registration in the Library was not confirmed. This did not register a conversation attachment. |
+| Oct 19 | Call `uploadFile(file, {library: true})` | Success response; this did not register a current-conversation attachment. |
 | Oct 19 | Probe model context and file delivery | Host upload succeeded; direct AI reading still failed. |
+| Oct 26 | Search for the uploaded file in the ChatGPT Library UI | File not found. Internal registration failure versus UI non-exposure remains unresolved. |
 
 Two further probes explored alternatives:
 
@@ -31,7 +32,8 @@ The following paths were considered but **not verified end to end** in these exp
 | Stage | Result in the tested setup |
 | --- | --- |
 | RAG3 to ChatGPT host file storage | Confirmed by `fileId` and matching downloaded hash. |
-| Current-conversation attachment registration | Did not occur. Library registration was not confirmed separately. |
+| ChatGPT Library | `library: true` returned success, but the file was not found in the Library UI. Internal registration status remains unknown. |
+| Current-conversation attachment registration | Did not occur. |
 | Native AI reading of the original PDF | Not demonstrated; the direct `fileId` attempt failed. |
 
 For questions about indexed documents, use RAG3's `rag3_search`, `rag3_fetch`, and `rag3_get_document` text results. Use `rag3_get_page` for a specific PDF page image and `rag3_get_source` for a user-facing original download. Do not present the download card, returned URI, or host `fileId` as proof that the whole original PDF entered the model's context.

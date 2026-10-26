@@ -6,7 +6,7 @@ This repository contains the indexing and retrieval service. Model weights, pers
 
 **ChatGPT on the web can search your RAG3 collections.** Run RAG3 on your Windows PC, connect its local MCP endpoint through [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and install the resulting custom MCP plugin in ChatGPT. This path was exercised on the development PC. Each installation needs its own tunnel and ChatGPT workspace access; cloning this repository alone does not connect ChatGPT. See [MCP setup](docs/usage.md#chatgpt-on-the-web).
 
-**Original-file handoff has a measured boundary.** Experiments uploaded a PDF from RAG3 to ChatGPT host storage and downloaded matching bytes, but did not register it as an attachment in the current conversation or establish native PDF reading by the AI. Use RAG3 search, chunk reads, and page images when asking ChatGPT about indexed documents. The [experiment record](docs/chatgpt-file-handoff.md) separates the observed results from untested paths.
+**Original-file handoff has a measured boundary.** Experiments uploaded a PDF from RAG3 to ChatGPT host storage and downloaded matching bytes, but did not register it as an attachment in the current conversation or establish native PDF reading by the AI. A later Library UI search did not find the uploaded file; the experiment cannot distinguish failed Library registration from an item hidden in that UI. Use RAG3 search, chunk reads, and page images when asking ChatGPT about indexed documents. The [experiment record](docs/chatgpt-file-handoff.md) separates the observed results from untested paths.
 
 ## Engineering highlights
 
