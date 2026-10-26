@@ -1,26 +1,33 @@
-# RAG3 — local document search for desktop and ChatGPT
+# RAG3 — search your documents from ChatGPT on the web
 
-RAG3 is a Windows document indexing and retrieval system with a desktop UI, a shared HTTP backend, and MCP tools. It parses local files with Docling, indexes them in Qdrant, and searches with BGE-M3 semantic vectors, native BM25, or hybrid rank fusion.
+**Index a PDF on your Windows PC. Ask about it from ChatGPT, Codex, or the desktop UI. Trace an answer back to the source.**
 
-## Start here
+RAG3 turns local documents into a searchable collection. Docling parses PDFs and other formats; BGE-M3 and Qdrant index both meaning and exact terms. A shared backend serves the desktop UI and MCP clients, so a document added in one place is searchable from the others after ingestion completes.
 
-| I want to... | Open this guide |
+## Picture the workflow
+
+1. **Add a document.** Create a `demo` collection in the desktop UI, add a PDF, click **Run**, and wait for **COMPLETE**. RAG3 keeps a verified source copy and indexes its text with page metadata when available.
+2. **Ask a real question.** Search in the UI, or connect the MCP plugin and ask ChatGPT on the web:
+
+   > Search my `demo` collection for the main findings. Read the matching chunks and show the document title and available source pages. If the evidence is thin, tell me what is missing.
+
+3. **Inspect the evidence.** Read the returned chunks, compare semantic, BM25, and fused results, or request a PDF page image for a figure or table.
+
+This ChatGPT web path was exercised on the development PC. It uses an [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) and a custom MCP plugin; each user needs their own tunnel and ChatGPT workspace access. RAG3 supplies retrieved content to the model on request. The original PDF does not automatically become a ChatGPT conversation attachment.
+
+## Try it
+
+| Step | Guide |
 | --- | --- |
-| Install RAG3 and its Python, WSL2, Docker, Qdrant, and model dependencies | [Windows installation](docs/install-windows.md) |
-| Run the desktop UI or connect a local Codex / ChatGPT web MCP plugin | [Using RAG3](docs/usage.md) |
-| Follow a PDF-to-answer walkthrough and copy example prompts | [Worked examples](docs/examples.md) |
-| Understand the backend, indexing, and retrieval design | [Architecture](docs/architecture.md) |
-| Check measured behavior and known limits | [Verification](docs/verification.md) · [ChatGPT file-handoff experiments](docs/chatgpt-file-handoff.md) |
+| 1. Install Python, WSL2, Docker, Qdrant, and local models | [Windows installation](docs/install-windows.md) |
+| 2. Start RAG3 and connect your preferred client | [Desktop, Codex, and ChatGPT web setup](docs/usage.md) |
+| 3. Follow a PDF-to-answer walkthrough | [Worked examples and copyable prompts](docs/examples.md) |
 
-**A typical run:** Create a collection named `demo` in the desktop UI, add a PDF, click **Run**, and wait for **COMPLETE**. Then search it in the UI or ask ChatGPT on the web through the installed RAG3 plugin: “Search my `demo` collection for the main findings, read the matching chunks, and include available source pages.” The [worked examples](docs/examples.md) show the exact steps and MCP calls.
-
-This repository contains the indexing and retrieval service. Model weights, personal documents, the Qdrant volume, and tunnel credentials are not part of the source tree.
-
-**ChatGPT on the web can search your RAG3 collections.** Run RAG3 on your Windows PC, connect its local MCP endpoint through [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and install the resulting custom MCP plugin in ChatGPT. This path was exercised on the development PC. Each installation needs its own tunnel and ChatGPT workspace access; cloning this repository alone does not connect ChatGPT. See [MCP setup](docs/usage.md#chatgpt-on-the-web).
-
-**Original-file handoff has a measured boundary.** Experiments uploaded a PDF from RAG3 to ChatGPT host storage and downloaded matching bytes, but did not register it as an attachment in the current conversation or establish native PDF reading by the AI. A later Library UI search did not find the uploaded file; the experiment cannot distinguish failed Library registration from an item hidden in that UI. Use RAG3 search, chunk reads, and page images when asking ChatGPT about indexed documents. The [experiment record](docs/chatgpt-file-handoff.md) separates the observed results from untested paths.
+Want the internals? Read the [architecture](docs/architecture.md), [verification results](docs/verification.md), and [file-handoff experiments](docs/chatgpt-file-handoff.md).
 
 ## Engineering highlights
+
+One measured local run indexed a **535-page PDF into 252 chunks in 30.7 minutes** on a 4 GiB Quadro T1000. Dense, BM25, and hybrid searches all found the source in that run. The [verification notes](docs/verification.md) show what was measured and what was not.
 
 - **One backend for three clients.** The PySide6 UI, local Codex plugin, and ChatGPT web plugin use the same collections, ingestion jobs, and retrieval path. Closing the UI leaves the backend running.
 - **GPU ownership on a 4 GiB card.** Long PDFs use a short-lived CUDA parser. RAG3 releases BGE-M3 before parsing and reloads it for embedding or semantic search, while BM25-only search stays available without the dense model.
@@ -70,7 +77,9 @@ Create a collection, add a PDF, run its job, then search the collection. The bac
 
 ## Verification and limits
 
-The [verification notes](docs/verification.md) include a repeatable disposable PDF-to-search check and one measured 535-page local run. On a Quadro T1000 with 4 GiB VRAM, that run indexed 252 chunks in 30.7 minutes and found the source through dense, BM25, and hybrid search. Device-wide GPU usage reached 3,873 MiB. These numbers describe one document and PC, not a general performance guarantee.
+The [verification notes](docs/verification.md) include a repeatable disposable PDF-to-search check and the measurements behind the run above. Device-wide GPU usage reached 3,873 MiB. These numbers describe one document and PC, not a general performance guarantee.
+
+**ChatGPT original-file boundary:** Experiments uploaded a PDF to ChatGPT host file storage and downloaded matching bytes, but did not register it as an attachment in the current conversation or make it directly readable by the AI. The uploaded file was not found in the Library UI; internal Library registration remains unknown. Search, chunk reads, and page images are the demonstrated ways to provide evidence to ChatGPT. See the [experiment record](docs/chatgpt-file-handoff.md).
 
 The code and workflow have been exercised on the development PC. A clean installation on a second PC has not yet been completed. The bundled infrastructure script currently expects the checkout at `C:\python_program\RAG3`; other locations require editing that script.
 
