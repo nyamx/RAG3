@@ -25,6 +25,8 @@ This ChatGPT web path was exercised on the development PC. It uses an [OpenAI Se
 
 Want the internals? Read the [architecture](docs/architecture.md), [verification results](docs/verification.md), and [file-handoff experiments](docs/chatgpt-file-handoff.md).
 
+Maintaining or extending RAG3? Start with the full project handoff: [한국어](docs/project-handoff.ko.md) · [English](docs/project-handoff.en.md).
+
 ## Engineering highlights
 
 One measured local run indexed a **535-page PDF into 252 chunks in 30.7 minutes** on a 4 GiB Quadro T1000. Dense, BM25, and hybrid searches all found the source in that run. The [verification notes](docs/verification.md) show what was measured and what was not.
