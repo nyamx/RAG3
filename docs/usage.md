@@ -52,4 +52,6 @@ The main MCP tool groups are:
 
 The UI and MCP clients share Qdrant collections and ingestion jobs. An MCP file submission starts work immediately; a UI file submission waits for **Run**. The MCP file attachment path accepts PDF, DOC, DOCX, MD, TXT, JSON, JSONL, CSV, and TSV. Other formats available in the UI are not all exposed as MCP attachments.
 
+For a complete PDF-to-answer walkthrough, example prompts, and explicit tool arguments, see [Worked examples](examples.md).
+
 For any other remote MCP client, the loopback address needs a separately configured connection. Tunnel profiles and credentials are not included in this repository.

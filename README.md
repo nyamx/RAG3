@@ -56,6 +56,10 @@ In another window, open the UI:
 
 Create a collection, add a PDF, run its job, then search the collection. The backend also serves `http://127.0.0.1:8000/mcp` for local MCP clients. See [Using RAG3](docs/usage.md) for the UI and MCP paths.
 
+## Try it with a document
+
+After installation, use the desktop UI to create a collection named `demo`, add a PDF you are allowed to process, and click **Run**. When the job reaches **COMPLETE**, search for a term from that PDF. For an MCP client, ask it to search the `demo` collection and read the matching chunks before answering. The [worked examples](docs/examples.md) give copyable prompts for the desktop UI, local Codex, and ChatGPT on the web, plus the underlying tool calls.
+
 ## Verification and limits
 
 The [verification notes](docs/verification.md) include a repeatable disposable PDF-to-search check and one measured 535-page local run. On a Quadro T1000 with 4 GiB VRAM, that run indexed 252 chunks in 30.7 minutes and found the source through dense, BM25, and hybrid search. Device-wide GPU usage reached 3,873 MiB. These numbers describe one document and PC, not a general performance guarantee.
