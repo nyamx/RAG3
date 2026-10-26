@@ -9,3 +9,7 @@ data/
 /launcher/bin/
 /launcher/obj/
 /launcher/publish/
+/artifacts/
+/.qdrant_runtime/
+/rag3/.probe/
+/requirements.reinstall.txt
