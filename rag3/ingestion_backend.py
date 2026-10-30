@@ -16,7 +16,8 @@ from pathlib import Path
 
 from rag3.constants import ROOT, DATA_ROOT
 from rag3.qdrant_clients import get_client
-from rag3.ingestion_manager import Scheduler, dispatch, JOB_ROOT, PORT as OLD_PORT
+from rag3.ingestion_manager import (Scheduler, dispatch, JOB_ROOT, PORT as OLD_PORT,
+                                    CHATGPT_SHARD_NAME)
 from rag3.ingestion_jobs import (connect, one, patch, ingestion_progress,
                                  set_ingestion_progress, clear_ingestion_progress,
                                  content_scope, mark_change, checkpoint_available)
@@ -62,6 +63,90 @@ def _source_counts(client, collection, sha):
             count(models.HasVectorCondition(has_vector='text-dense')),
             count(models.HasVectorCondition(has_vector='bm25')),
             count(models.FieldCondition(key='meta._rag3_ingest_state',match=models.MatchValue(value='ready'))))
+
+
+def _completed_chatgpt_sources(collection, current_sha):
+    """Only verified jobs may establish that a conversation was already ingested."""
+    with connect() as db:
+        complete=db.execute('''SELECT source_sha256, filename FROM jobs
+            WHERE collection=? AND status='COMPLETE' AND source_sha256 IS NOT NULL''',
+            (collection,)).fetchall()
+        unfinished=db.execute('''SELECT DISTINCT p.source_sha256, j.filename
+            FROM ingestion_progress p JOIN jobs j
+              ON j.collection=p.collection AND j.source_sha256=p.source_sha256
+            WHERE p.collection=? AND p.source_sha256<>? AND j.status<>'COMPLETE' ''',
+            (collection,current_sha)).fetchall()
+    if any(CHATGPT_SHARD_NAME.fullmatch(row['filename']) for row in unfinished):
+        raise ValueError('Another ChatGPT export has an unfinished checkpoint in this collection; resume or resolve it first')
+    return sorted({row['source_sha256'] for row in complete
+                   if CHATGPT_SHARD_NAME.fullmatch(row['filename'])})
+
+
+def _known_chatgpt_conversations(client, collection, current_sha, requested_ids):
+    """Return existing conversation IDs without reading stored text or vectors."""
+    if not requested_ids:
+        return set()
+    complete_sources=_completed_chatgpt_sources(collection,current_sha)
+    if not complete_sources:
+        return set()
+    from qdrant_client import models
+    fields=('meta.chatgpt_conversation_id','meta.source_sha256','meta._rag3_ingest_state')
+    indexed=client.get_collection(collection).payload_schema or {}
+    for field in fields:
+        if field not in indexed:
+            client.create_payload_index(collection_name=collection,field_name=field,
+                                        field_schema=models.PayloadSchemaType.KEYWORD,wait=True)
+    found=set()
+    candidates=sorted(requested_ids)
+    for offset in range(0,len(candidates),100):
+        batch=candidates[offset:offset+100]
+        filters=models.Filter(must=[
+            models.FieldCondition(key='meta.chatgpt_conversation_id',
+                                  match=models.MatchAny(any=batch)),
+            models.FieldCondition(key='meta.source_sha256',
+                                  match=models.MatchAny(any=complete_sources)),
+            models.FieldCondition(key='meta._rag3_ingest_state',
+                                  match=models.MatchValue(value='ready'))])
+        result=client.facet(collection_name=collection,key='meta.chatgpt_conversation_id',
+                            facet_filter=filters,exact=True,limit=len(batch))
+        values={hit.value for hit in result.hits if hit.count > 0}
+        if not values.issubset(batch):
+            raise RuntimeError('Qdrant returned an unexpected conversation ID')
+        found.update(values)
+    return found
+
+
+def _verified_completed_chatgpt_source(client, collection, sha):
+    """Recognize an unchanged, already completed shard before staging points."""
+    with connect() as db:
+        rows=db.execute('''SELECT filename,result FROM jobs WHERE collection=?
+            AND source_sha256=? AND status='COMPLETE' ORDER BY created_at DESC''',
+            (collection,sha)).fetchall()
+    expected=[]
+    for row in rows:
+        if not CHATGPT_SHARD_NAME.fullmatch(row['filename']) or not row['result']:
+            continue
+        result=json.loads(row['result'])
+        count=result.get('documents_written')
+        if isinstance(count,int) and not isinstance(count,bool) and count>=0:
+            expected.append(count)
+    if not expected:
+        return False
+    counts=_source_counts(client,collection,sha)
+    if counts[0] == 0 and 0 in expected:
+        return True
+    if counts[0] > 0 and counts[0] in expected and all(n==counts[0] for n in counts):
+        return True
+    raise ValueError('Previously completed ChatGPT source has missing or incomplete Qdrant points')
+
+
+def _empty_chatgpt_result(source, collection, sha, client):
+    from rag3.ingestion_light import preserve_source
+    preserved=preserve_source(source,expected_sha256=sha)
+    return {'status':'COMPLETE','source_sha256':sha,'collection':collection,
+            'managed_source':str(preserved['managed_source']),
+            'documents_written':0,'bm25_vectors_written':0,
+            'count_after':client.count(collection_name=collection,exact=True).count}
 
 
 def _client(url):
@@ -151,10 +236,18 @@ def _stage_plain(source,collection,sha,progress,should_stop,emit,url,*,commit_ba
     preserved=preserve_source(source,expected_sha256=sha)
     base_meta=dict(document_id=sha,title=preserved['title'],source_uri=preserved['source_uri'],
         source_sha256=sha,page_start=None,page_end=None,content_type='prose',document_version='1')
-    chunks=split_plain_text_source(preserved,base_meta)
-    if not chunks:
-        raise ValueError('Document produced no searchable chunks')
+    from rag3.chatgpt_export import SHARD, split_shard_source
     c=_client(url)
+    if SHARD.fullmatch(Path(source).name):
+        chunks=split_shard_source(preserved,base_meta,
+            lookup_existing=lambda ids:_known_chatgpt_conversations(c,collection,sha,ids))
+    else:
+        chunks=split_plain_text_source(preserved,base_meta)
+    if not chunks:
+        if SHARD.fullmatch(Path(source).name):
+            emit('STAGE parse SKIPPED (no new searchable conversations)')
+            return 0
+        raise ValueError('Document produced no searchable chunks')
     for offset in range(0,len(chunks),CHUNK_GROUP_SIZE):
         if should_stop():
             return
@@ -174,6 +267,7 @@ def _stage_plain(source,collection,sha,progress,should_stop,emit,url,*,commit_ba
     if not should_stop():
         set_ingestion_progress(collection,sha,progress_identity(sha,collection),'CHUNKS_STORED',len(chunks))
         emit('STAGE parse PASS')
+    return len(chunks)
 
 
 def _embed_source(job, gpu, should_stop, emit, url, *, register_request=None,
@@ -549,9 +643,11 @@ class BackendScheduler(Scheduler):
         result=None; error=None; completed=False; source_guard=None
         job_started=time.perf_counter()
         parse_elapsed=None; parser_detail={}
+        no_new_chatgpt=False
         try:
             source_guard=OriginalSourceGuard(job['source'], job['source_sha256'])
             sha,collection=job['source_sha256'],job['collection']
+            is_chatgpt=bool(CHATGPT_SHARD_NAME.fullmatch(Path(job['source']).name))
             progress=ingestion_progress(collection,sha)
             if job['mode']=='resume':
                 progress=_compatible(job,url=self.qdrant_url,source_guard=source_guard)
@@ -559,6 +655,10 @@ class BackendScheduler(Scheduler):
                 raise ValueError('Existing checkpoint: explicit validated Resume/Restart required')
             else:
                 c=_client(self.qdrant_url)
+                if is_chatgpt and _verified_completed_chatgpt_source(c,collection,sha):
+                    result=_empty_chatgpt_result(Path(job['source']),collection,sha,c)
+                    completed=True
+                    return
                 if _source_counts(c,collection,sha)[0]:
                     raise ValueError('Existing points for SHA; refuse implicit delete')
                 set_ingestion_progress(collection,sha,progress_identity(sha,collection),'PARSING')
@@ -567,10 +667,11 @@ class BackendScheduler(Scheduler):
                 parse_started=time.perf_counter()
                 self._stage(job,'STAGE parse RUN')
                 if Path(job['source']).suffix.lower() in PLAIN_TEXT_SUFFIXES:
-                    _stage_plain(Path(job['source']),collection,sha,progress,
+                    staged_count=_stage_plain(Path(job['source']),collection,sha,progress,
                                  lambda:self._stopping(job),lambda msg:self._stage(job,msg),self.qdrant_url,
                                  commit_batch=lambda client,collection,points:
                                      self._commit_batch(job,client,collection,points))
+                    no_new_chatgpt=is_chatgpt and staged_count==0
                 else:
                     parsed=(self._parse_cuda(job) if _use_cuda_parser(job['source'])
                             else self._parse_cpu(job))
@@ -580,19 +681,26 @@ class BackendScheduler(Scheduler):
                         _verify_reparsed_points(_client(self.qdrant_url),collection,sha,parsed)
                 parse_elapsed=round(time.perf_counter()-parse_started,3)
             if not self._stopping(job):
-                embed_started=time.perf_counter()
-                self._stage(job,'STAGE embedding RUN')
-                result=_embed_source(job,self.gpu,lambda:self._stopping(job),
-                                     lambda msg:self._stage(job,msg),self.qdrant_url,
-                                     register_request=lambda request:self._register_gpu_request(job,request),
-                                     clear_request=self._clear_gpu_request, source_guard=source_guard,
-                                     commit_batch=lambda client,collection,points:
-                                         self._commit_batch(job,client,collection,points))
-                completed=result.get('status')=='COMPLETE'
+                if no_new_chatgpt:
+                    result=_empty_chatgpt_result(Path(job['source']),collection,sha,
+                                                 _client(self.qdrant_url))
+                    completed=True
+                    embed_elapsed=0.0
+                else:
+                    embed_started=time.perf_counter()
+                    self._stage(job,'STAGE embedding RUN')
+                    result=_embed_source(job,self.gpu,lambda:self._stopping(job),
+                                         lambda msg:self._stage(job,msg),self.qdrant_url,
+                                         register_request=lambda request:self._register_gpu_request(job,request),
+                                         clear_request=self._clear_gpu_request, source_guard=source_guard,
+                                         commit_batch=lambda client,collection,points:
+                                             self._commit_batch(job,client,collection,points))
+                    completed=result.get('status')=='COMPLETE'
+                    embed_elapsed=round(time.perf_counter()-embed_started,3)
                 if completed:
                     result['timings']={
                         'parse_phase_seconds':parse_elapsed,
-                        'embedding_phase_seconds':round(time.perf_counter()-embed_started,3),
+                        'embedding_phase_seconds':embed_elapsed,
                         'total_seconds':round(time.perf_counter()-job_started,3),
                         **parser_detail,
                     }

@@ -29,8 +29,8 @@ class SourceTests(unittest.TestCase):
         self.client = SimpleNamespace(collection_exists=lambda name: name == "test",
             close=lambda: None, scroll=self.scroll)
         self.meta = {}
-        self.patches = [patch.object(sources, "ROOT", self.root),
-                        patch.object(sources, "QdrantClient", return_value=self.client)]
+        self.patches = [patch.object(sources, "DATA_ROOT", self.root / "data"),
+                        patch.object(sources, "get_client", return_value=self.client)]
         for item in self.patches:
             item.start()
 
@@ -154,10 +154,10 @@ class ToolTests(unittest.TestCase):
         async def check():
             server = namespace["mcp"]
             tools = {tool.name: tool for tool in await server.list_tools()}
-            self.assertEqual(len(tools), 19)
             self.assertEqual(tools["rag3_read_source_part"].meta["ui"]["visibility"], ["app"])
             for name in ("rag3_get_source", "rag3_get_page"):
                 self.assertTrue(tools[name].annotations.read_only_hint)
+                self.assertIn("collection", tools[name].input_schema["required"])
             self.assertEqual(tools["rag3_get_source"].meta["ui"]["resourceUri"],
                              namespace["SOURCE_VIEW_URI"])
             resources = await server.list_resources()

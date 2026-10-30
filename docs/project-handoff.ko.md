@@ -4,7 +4,7 @@
 
 ## 1. 프로젝트가 제공하는 것
 
-RAG3는 Windows PC에 있는 문서를 수집·색인하고 데스크톱 UI, 로컬 Codex MCP 플러그인, ChatGPT 웹 MCP 플러그인에서 같은 컬렉션을 검색하는 시스템이다. PDF의 텍스트뿐 아니라 가능한 경우 페이지 범위와 원본을 보존해 검색 결과를 확인할 수 있게 한다. ChatGPT 웹 연결은 로컬 MCP 서버 앞에 Secure MCP Tunnel과 사용자별 커스텀 플러그인을 두는 방식이다.
+RAG3는 Windows PC에 있는 문서를 수집·색인하고 데스크톱 UI, 로컬 Codex MCP 플러그인, ChatGPT 웹·Android 앱의 MCP 플러그인에서 같은 컬렉션을 검색하는 시스템이다. PDF의 텍스트뿐 아니라 가능한 경우 페이지 범위와 원본을 보존해 검색 결과를 확인할 수 있게 한다. ChatGPT 연결은 로컬 MCP 서버 앞에 Secure MCP Tunnel과 사용자별 커스텀 플러그인을 두는 방식이다.
 
 핵심 경계는 **문서 전체를 AI 대화 첨부로 전달하는 기능**과 **색인된 문서의 관련 내용만 검색해 모델에 제공하는 기능**의 차이다. 후자는 실제 사용 경로다. 전자는 호스트 파일 저장까지 확인했지만 대화 첨부 등록과 모델의 원본 PDF 직접 읽기는 확인되지 않았다.
 
@@ -14,7 +14,7 @@ RAG3는 Windows PC에 있는 문서를 수집·색인하고 데스크톱 UI, 로
 Windows 사용자
   ├─ PySide6 UI ── 인증된 /api/v1/command ─┐
   ├─ Codex 로컬 MCP ── /mcp ───────────────┤
-  └─ ChatGPT 웹 ── Secure MCP Tunnel ─ /mcp ┤
+  └─ ChatGPT 웹·Android ── MCP Tunnel ─ /mcp ┤
                                             ▼
                               공용 HTTP/MCP 백엔드 (Python)
                               ├─ SQLite 작업 저널·스케줄러
@@ -61,7 +61,7 @@ GPU 4 GiB 환경 때문에 파서와 임베딩 모델을 동시에 계속 올리
 ## 5. 검색·읽기 구현
 
 - [retrieval.py](../rag3/retrieval.py)는 BGE-M3 dense 질의와 Qdrant native BM25 질의를 선택적으로 실행한다. 두 방법의 융합은 Qdrant RRF로 수행하며 동일 점수는 포인트 ID로 안정 정렬한다. 메타데이터 필터는 후보 검색 단계에 적용된다.
-- UI와 MCP는 같은 검색 경로를 호출한다. MCP의 rag3_search_flexible은 컬렉션, 후보 수, 메타데이터 필터를 호출별로 받을 수 있어 세션 ID가 없는 원격 연결에 적합하다.
+- UI와 MCP는 같은 검색 경로를 호출한다. 모든 MCP 검색은 비어 있지 않은 `collections` 배열을 반드시 받아 컬렉션별로 독립 검색한다. `rag3_search_flexible`은 후보 수와 메타데이터 필터도 받고, 결과의 컬렉션 이름을 `rag3_fetch`에 전달해야 한다.
 - [rag3-mcp-server.py](../scripts/rag3-mcp-server.py)는 검색 결과를 출처 정보와 청크 ID로 정리한다. rag3_fetch는 한 청크를 문자 오프셋으로 이어 읽게 한다. 검색 발췌만으로 원문 전체를 읽었다고 판단하지 않는다.
 - [collections.py](../rag3/collections.py)는 컬렉션·문서 목록, 문서 조회·삭제, 장절 메타데이터 보정을 담당한다. 장절 보정은 기본 dry run이고 실제 쓰기 전에 대상 포인트 소속을 검증한다.
 - [sources.py](../rag3/sources.py)는 컬렉션·문서 ID에서 관리 원본을 역참조하고 파일 경로·해시를 검증한다. rag3_get_source는 사용자용 원본 다운로드 정보를, rag3_get_page는 PDF 실제 페이지의 이미지를 제공한다.
@@ -94,7 +94,7 @@ GPU 4 GiB 환경 때문에 파서와 임베딩 모델을 동시에 계속 올리
 | 로그인 설정 | data/backend-login-config.json. 포트·Qdrant 주소·백엔드 전체 쓰기/삭제 정책 등 비밀값 없는 설정이다. |
 | 터널 자격 증명 | 사용자별 로컬 저장 프로필. 저장소·문서·로그에 포함하지 않는다. |
 
-HTTP 서버 기본 바인딩은 127.0.0.1이다. UI 명령 API는 백엔드가 발급하고 재시작 시 교체하는 X-RAG3-Token을 사용한다. MCP는 이 UI 토큰을 사용하지 않으며 RAG3_MCP_WRITE_ENABLED와 RAG3_MCP_DELETE_ENABLED가 **백엔드 전체** 쓰기·삭제 권한을 제어한다. 수동 서버 실행 시 코드 기본값은 둘 다 허용이므로 원격 연결 전에 정책을 명시적으로 확인해야 한다. 세션 없는 MCP 연결은 컬렉션을 호출별로 전달하고, 세션 선택이 다른 사용자에게 전파된다고 가정하지 않는다. Compose의 Qdrant 포트는 현재 호스트 IP 제한 없이 게시되므로 네트워크 노출을 별도 점검한다.
+HTTP 서버 기본 바인딩은 127.0.0.1이다. UI 명령 API는 백엔드가 발급하고 재시작 시 교체하는 X-RAG3-Token을 사용한다. MCP는 이 UI 토큰을 사용하지 않으며 RAG3_MCP_WRITE_ENABLED와 RAG3_MCP_DELETE_ENABLED가 **백엔드 전체** 쓰기·삭제 권한을 제어한다. 수동 서버 실행 시 코드 기본값은 둘 다 허용이므로 원격 연결 전에 정책을 명시적으로 확인해야 한다. 세션 없는 MCP 연결의 레거시 컬렉션 선택은 서버 프로세스 전체에 적용되지만 검색·원본 호출은 이 선택을 무시하고 컬렉션 이름을 명시적으로 요구한다. Compose의 Qdrant 포트는 현재 호스트 IP 제한 없이 게시되므로 네트워크 노출을 별도 점검한다.
 
 ## 8. 시작·검증·인계 시 순서
 

@@ -75,6 +75,10 @@ def collection_contents(collection: str, *, url: str = DEFAULT_QDRANT_URL,
                 "document_id": document_id, "title": meta.get("title"),
                 "source_uri": meta.get("source_uri"),
                 "source_sha256": meta.get("source_sha256"),
+                "source_kind": meta.get("source_kind"),
+                "chatgpt_export_file": meta.get("chatgpt_export_file"),
+                "chatgpt_conversation_id": None if meta.get("chatgpt_export_file")
+                else meta.get("chatgpt_conversation_id"),
                 "chunk_count": 0, "_page_starts": [], "_page_ends": [],
             })
             item["chunk_count"] += 1
@@ -131,6 +135,12 @@ def get_document(collection: str, document_id: str, *, url: str = DEFAULT_QDRANT
                        "page_start": (point.payload or {}).get("meta", {}).get("page_start"),
                        "page_end": (point.payload or {}).get("meta", {}).get("page_end"),
                        "section_paths": (point.payload or {}).get("meta", {}).get("section_paths") or [],
+                       "chatgpt_conversation_id": (point.payload or {}).get("meta", {}).get("chatgpt_conversation_id"),
+                       "chatgpt_conversation_title": (point.payload or {}).get("meta", {}).get("chatgpt_conversation_title"),
+                       "chatgpt_message_id": (point.payload or {}).get("meta", {}).get("chatgpt_message_id"),
+                       "chatgpt_role": (point.payload or {}).get("meta", {}).get("chatgpt_role"),
+                       "chatgpt_turn_index": (point.payload or {}).get("meta", {}).get("chatgpt_turn_index"),
+                       "chatgpt_message_created_at_ms": (point.payload or {}).get("meta", {}).get("chatgpt_message_created_at_ms"),
                        "content": (point.payload or {}).get("content") or ""}
                       for point in selected]
             return {"collection": collection, **item, "chunks": chunks,

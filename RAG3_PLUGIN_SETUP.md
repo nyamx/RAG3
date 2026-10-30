@@ -69,7 +69,7 @@ codex plugin list --json
 
 로컬 `127.0.0.1` 주소는 클라우드 ChatGPT에서 직접 접속할 수 없다. 기존 OpenAI Secure MCP Tunnel이 같은 `http://127.0.0.1:8000/mcp`를 전달하도록 구성돼 있다. 저장된 DPAPI 키, alias, 프로필, 터널 ID는 유지하며 URL/자격 증명을 문서·로그에 적지 않는다. `scripts/rag3-tunnel-autostart.py`는 백엔드 준비 후 호출되는 **비상주 연결 도우미**이고, 터널 자체 런타임은 별도 프로세스다.
 
-2026-10-24 진단 결과 터널 런타임 `healthy=True`, `ready=True`였고, 이 채팅에 연결된 RAG3 앱에서 컬렉션 목록·공유 작업 목록·BM25 및 의미 검색을 실제 호출했다. 연결 앱 호출에 맞춰 기존 터널 dispatch 로그가 증가했다. 별도의 공개 URL 식별과 초기화 교환 캡처는 하지 않았다. 원격 연결에 세션 ID가 없으면 `rag3_select_collection`은 `SESSION_REQUIRED`를 반환한다. 설정된 기본 컬렉션은 일반 검색으로, 다른 컬렉션은 `rag3_search_flexible(collection=...)`로 검색한다. 선택 상태를 여러 사용자에게 공유하지 않는다. 기존 등록과 키를 유지하고 불필요한 새 터널·새 키를 생성하지 않는다.
+2026-10-24 진단 결과 터널 런타임 `healthy=True`, `ready=True`였고, 이 채팅에 연결된 RAG3 앱에서 컬렉션 목록·공유 작업 목록·BM25 및 의미 검색을 실제 호출했다. 연결 앱 호출에 맞춰 기존 터널 dispatch 로그가 증가했다. 별도의 공개 URL 식별과 초기화 교환 캡처는 하지 않았다. 현재 검색 도구는 `collections` 배열을 반드시 받아 컬렉션마다 독립적으로 검색하고, 각 결과에 컬렉션 이름을 담는다. `rag3_fetch`, 원본 파일 및 PDF 페이지 조회는 `collection`을 반드시 받는다. `rag3_select_collection`은 이전 클라이언트를 위한 선택 기능으로 남아 있지만 검색과 원문 읽기에는 적용되지 않는다. 기존 등록과 키를 유지하고 불필요한 새 터널·새 키를 생성하지 않는다.
 
 연결/복구 점검: 로컬 `/health`에서 PID와 준비 상태 확인 → 로컬 `/mcp`에서 `initialize`, `tools/list`, 읽기 호출 → 기존 `tunnel-client` 상태와 프로필 확인 → 실제 **외부** 종단에서 동일한 MCP 읽기 호출. 원격 연결을 확인하지 못하면 문서에 정확히 미검증으로 기록한다.
 

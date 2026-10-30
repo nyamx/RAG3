@@ -69,7 +69,7 @@ async def mcp_query(url):
             tools=await session.list_tools()
             assert 'rag3_search_advanced' in {x.name for x in tools.tools}
             response=await session.call_tool('rag3_search_advanced',{'query':'pine',
-                'semantic':False,'bm25':True,'rank_fusion':False,'top_k':3,'collection':COL})
+                'semantic':False,'bm25':True,'rank_fusion':False,'top_k':3,'collections':[COL]})
             assert not response.is_error, str(response)
             return response.structured_content or json.loads(response.content[0].text)
 

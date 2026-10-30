@@ -1,29 +1,50 @@
-# RAG3 — search your documents from ChatGPT on the web
+# RAG3 — search your documents from desktop and ChatGPT
 
-**Index a PDF on your Windows PC. Ask about it from ChatGPT, Codex, or the desktop UI. Trace an answer back to the source.**
+**Index documents on your Windows PC. Search them from the desktop UI, Codex, or ChatGPT on the web and Android app. Trace an answer back to the source.**
 
 RAG3 turns local documents into a searchable collection. Docling parses PDFs and other formats; BGE-M3 and Qdrant index both meaning and exact terms. A shared backend serves the desktop UI and MCP clients, so a document added in one place is searchable from the others after ingestion completes.
 
 ## Picture the workflow
 
 1. **Add a document.** Create a `demo` collection in the desktop UI, add a PDF, click **Run**, and wait for **COMPLETE**. RAG3 keeps a verified source copy and indexes its text with page metadata when available.
-2. **Ask a real question.** Search in the UI, or connect the MCP plugin and ask ChatGPT on the web:
+2. **Ask a real question.** Search in the UI, or connect the MCP plugin and ask ChatGPT on the web or Android app:
 
    > Search my `demo` collection for the main findings. Read the matching chunks and show the document title and available source pages. If the evidence is thin, tell me what is missing.
 
 3. **Inspect the evidence.** Read the returned chunks, compare semantic, BM25, and fused results, or request a PDF page image for a figure or table.
 
-This ChatGPT web path was exercised on the development PC. It uses an [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) and a custom MCP plugin; each user needs their own tunnel and ChatGPT workspace access. RAG3 supplies retrieved content to the model on request. The original PDF does not automatically become a ChatGPT conversation attachment.
+The ChatGPT plugin was exercised in the web client and Android app with an [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) on the development PC. Each user needs their own tunnel and ChatGPT workspace access. RAG3 supplies retrieved content to the model on request. The original PDF does not automatically become a ChatGPT conversation attachment.
+
+## Actual screens
+
+Desktop UI searching a local SciFact collection with BGE-M3 semantic search, BM25, and rank fusion:
+
+![RAG3 desktop retrieval UI showing three search results](docs/images/rag3-desktop-search.jpg)
+
+User-provided capture of the ChatGPT Android app invoking the RAG3 MCP plugin to search a ChatGPT history collection:
+
+<img src="docs/images/rag3-chatgpt-android.jpg" alt="ChatGPT Android app using the RAG3 MCP plugin" width="300">
 
 ## Try it
 
 | Step | Guide |
 | --- | --- |
 | 1. Install Python, WSL2, Docker, Qdrant, and local models | [Windows installation](docs/install-windows.md) |
-| 2. Start RAG3 and connect your preferred client | [Desktop, Codex, and ChatGPT web setup](docs/usage.md) |
+| 2. Start RAG3 and connect your preferred client | [Desktop, Codex, and ChatGPT setup](docs/usage.md) |
 | 3. Follow a PDF-to-answer walkthrough | [Worked examples and copyable prompts](docs/examples.md) |
 
 Want the internals? Read the [architecture](docs/architecture.md), [verification results](docs/verification.md), and [file-handoff experiments](docs/chatgpt-file-handoff.md).
+
+## Search your ChatGPT export
+
+Download your ChatGPT data export, then import its ZIP or extracted folder while the RAG3 backend is running:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\import-chatgpt-export.py "$env:USERPROFILE\Downloads\chatgpt-export.zip" --dry-run
+.\.venv\Scripts\python.exe scripts\import-chatgpt-export.py "$env:USERPROFILE\Downloads\chatgpt-export.zip"
+```
+
+The importer creates the `chatgpt_history_files` collection and stores each `conversations-*.json` file as one RAG3 document. Search chunks retain their conversation and message IDs. Select that collection in the desktop UI or ChatGPT MCP plugin to search it. It indexes visible text on each conversation's current path; image contents and internal reasoning records are excluded. Repeating an unchanged import skips indexed files. Changed files are reported for review rather than added as duplicate documents. Import and embeddings run locally without a paid API.
 
 Maintaining or extending RAG3? Start with the full project handoff: [한국어](docs/project-handoff.ko.md) · [English](docs/project-handoff.en.md).
 
@@ -31,7 +52,7 @@ Maintaining or extending RAG3? Start with the full project handoff: [한국어](
 
 One measured local run indexed a **535-page PDF into 252 chunks in 30.7 minutes** on a 4 GiB Quadro T1000. Dense, BM25, and hybrid searches all found the source in that run. The [verification notes](docs/verification.md) show what was measured and what was not.
 
-- **One backend for three clients.** The PySide6 UI, local Codex plugin, and ChatGPT web plugin use the same collections, ingestion jobs, and retrieval path. Closing the UI leaves the backend running.
+- **One backend across clients.** The PySide6 UI, local Codex plugin, and ChatGPT plugin on web and Android use the same collections, ingestion jobs, and retrieval path. Closing the UI leaves the backend running.
 - **GPU ownership on a 4 GiB card.** Long PDFs use a short-lived CUDA parser. RAG3 releases BGE-M3 before parsing and reloads it for embedding or semantic search, while BM25-only search stays available without the dense model.
 - **Recoverable ingestion.** A SQLite job journal records progress and state; the UI can pause, resume, retry, and cancel jobs. Managed source copies carry SHA-256 checks for source retrieval.
 - **Inspectable retrieval.** BGE-M3 dense vectors and Qdrant's native BM25 sparse vectors support semantic, lexical, and reciprocal-rank-fusion search. Results retain source metadata and PDF page information when available.
@@ -40,7 +61,7 @@ One measured local run indexed a **535-page PDF into 252 chunks in 30.7 minutes*
 ```text
 PySide6 desktop UI -------------------+
 Codex local MCP plugin ---------------+--> Shared RAG3 backend
-ChatGPT web --> Secure MCP Tunnel ----+      |-- SQLite job journal
+ChatGPT web/Android --> MCP Tunnel ----+      |-- SQLite job journal
                                             |-- Docling parser and BGE-M3
                                             |-- Qdrant dense and BM25 index
                                             +-- managed source files
@@ -55,7 +76,7 @@ The [architecture notes](docs/architecture.md) explain the data flow, GPU handof
 | Desktop UI and backend | Windows x64, Python 3.11, NVIDIA GPU and compatible driver, WSL2 Ubuntu, Docker Engine and Compose in Ubuntu, Qdrant, local BGE-M3 and Docling models |
 | Optional launcher | .NET 8 runtime; .NET 8 SDK only to build `RAG3.exe` |
 | Local Codex MCP plugin | Running backend and Codex with local plugin support |
-| ChatGPT web MCP plugin | Running backend, Secure MCP Tunnel client and permissions, ChatGPT custom MCP plugin access |
+| ChatGPT web or Android MCP plugin | Running backend, Secure MCP Tunnel client and permissions, ChatGPT custom MCP plugin access |
 
 Microsoft Word is needed only for legacy `.doc` conversion. The [Windows installation guide](docs/install-windows.md) lists the setup and checks for every component.
 

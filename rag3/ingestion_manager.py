@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import signal
 import secrets
 import sqlite3
@@ -32,6 +33,7 @@ JOB_ROOT = DATA_ROOT / 'mcp_jobs'
 SUPPORTED_UI = {'.pdf','.doc','.docx','.md','.pptx','.xlsx','.html','.htm','.txt',
                 '.json','.jsonl','.csv','.tsv',
                 '.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
+CHATGPT_SHARD_NAME = re.compile(r'conversations(?:-\d+)?\.json\Z')
 
 
 # Only the lock-owning backend may install the in-process scheduler.
@@ -143,13 +145,15 @@ class Scheduler:
         if collection not in names:
             raise ValueError(f'collection does not exist: {collection}; create/select an existing collection first')
 
-    def conflict(self, sha, collection, excluding=''):
+    def conflict(self, sha, collection, excluding='', *, allow_completed=False):
         if not sha:
             return
         with connect() as db:
             rows = db.execute("SELECT job_id, collection, status FROM jobs WHERE source_sha256=? AND job_id!=?", (sha, excluding)).fetchall()
         for row in rows:
             if row['collection'] == collection and row['status'] not in {'FAILED','CANCELLED'}:
+                if allow_completed and row['status'] == 'COMPLETE':
+                    continue
                 raise ValueError('the same SHA is already queued or running in this collection')
             if row['collection'] != collection and row['status'] not in TERMINAL:
                 raise ValueError('same SHA is active in another collection; checkpoint path is shared')
@@ -183,7 +187,8 @@ class Scheduler:
                 raise ValueError('unsupported document format')
             _validate_content(Path(filename).suffix.lower(), raw)
             sha, size = hashlib.sha256(raw).hexdigest(), len(raw)
-            self.conflict(sha, collection)
+            self.conflict(sha, collection,
+                          allow_completed=bool(CHATGPT_SHARD_NAME.fullmatch(filename)))
             folder = JOB_ROOT / job_id; folder.mkdir(parents=True, exist_ok=True)
             source = folder / filename
             source.write_bytes(raw)
@@ -194,7 +199,8 @@ class Scheduler:
                 raise ValueError('unsupported or missing source file')
             filename = source.name
             sha, size = self.digest(source), source.stat().st_size
-            self.conflict(sha, collection)
+            self.conflict(sha, collection,
+                          allow_completed=bool(CHATGPT_SHARD_NAME.fullmatch(filename)))
             status, stage = 'QUEUED', 'Ready'
         with connect() as db:
             ts = now()
@@ -230,7 +236,8 @@ class Scheduler:
             _validate_source(path)
             checkpoint()  # Do not wait for download Resume while holding manager lock.
             with self.lock:
-                self.conflict(sha, one(job_id,private=True)['collection'], excluding=job_id)
+                self.conflict(sha, one(job_id,private=True)['collection'], excluding=job_id,
+                              allow_completed=bool(CHATGPT_SHARD_NAME.fullmatch(name)))
                 with connect() as db:
                     patch(db,job_id, source=str(path),filename=name,source_sha256=sha,
                           file_size=count,downloaded_bytes=count,status='QUEUED',stage='Ready')

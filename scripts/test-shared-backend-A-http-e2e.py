@@ -301,6 +301,9 @@ try:
                 for name in ['rag3_search','rag3_fetch','rag3_search_advanced','rag3_search_flexible','rag3_select_collection','rag3_list_collections']:
                     assert name in names,('missing tool',name)
                     assert 'ctx' not in names[name].input_schema.get('properties',{}),(name,names[name].input_schema)
+                for name in ['rag3_search','rag3_search_advanced','rag3_search_flexible']:
+                    assert 'collections' in names[name].input_schema['required'], names[name].input_schema
+                assert 'collection' in names['rag3_fetch'].input_schema['required']
                 print('MCP_SCHEMA_OK tool_count='+str(len(names)),flush=True)
                 async def call(session,name,args=None):
                     reply=await session.call_tool(name,args or {})
@@ -317,29 +320,34 @@ try:
                     assert aa['selected']==COLLECTIONS[0] and bb['selected']==COLLECTIONS[1],(aa,bb)
                 print('MCP_TWO_SESSIONS_ISOLATED_OK calls=10',flush=True)
 
-                async def search(session, collection=None):
+                async def search(session, collection):
                     args={'query':'source', 'semantic':False, 'bm25':True,
-                          'rank_fusion':False, 'top_k':1}
-                    if collection is not None: args['collection']=collection
+                          'rank_fusion':False, 'top_k':1,
+                          'collections':[collection]}
                     result=await call(session,'rag3_search_advanced',args)
                     assert len(result['results'])==1,result
                     return result['results'][0]
 
-                alpha,beta=await asyncio.gather(search(a),search(b))
+                alpha,beta=await asyncio.gather(search(a,COLLECTIONS[0]),search(b,COLLECTIONS[1]))
                 assert alpha['title']=='Alpha source' and beta['title']=='Beta source',(alpha,beta)
                 explicit_beta=await search(a,COLLECTIONS[1])
                 assert explicit_beta['title']=='Beta source',explicit_beta
-                assert (await search(a))['id']==alpha['id'], 'explicit collection changed the session selection'
+                assert (await search(a,COLLECTIONS[0]))['id']==alpha['id']
+                both=await call(a,'rag3_search_advanced',{'query':'source','semantic':False,
+                    'bm25':True,'rank_fusion':False,'top_k':1,'collections':COLLECTIONS})
+                assert [hit['collection'] for hit in both['results']]==COLLECTIONS,both
+                invalid=await a.call_tool('rag3_search',{'query':'source','collections':['missing']})
+                assert invalid.is_error and 'rag3_list_collections' in invalid.content[0].text,invalid
 
                 fetched_a,fetched_b=await asyncio.gather(
-                    call(a,'rag3_fetch',{'id':alpha['id']}),
-                    call(b,'rag3_fetch',{'id':beta['id']}))
+                    call(a,'rag3_fetch',{'id':alpha['id'],'collection':COLLECTIONS[0]}),
+                    call(b,'rag3_fetch',{'id':beta['id'],'collection':COLLECTIONS[1]}))
                 assert fetched_a['text']=='Alpha session source text.',fetched_a
                 assert fetched_b['text']=='Beta session source text.',fetched_b
                 explicit_fetch=await call(a,'rag3_fetch',{'id':beta['id'],'collection':COLLECTIONS[1]})
                 assert explicit_fetch['text']==fetched_b['text'],explicit_fetch
-                assert (await call(a,'rag3_fetch',{'id':alpha['id']}))['text']==fetched_a['text']
-                wrong_collection=await a.call_tool('rag3_fetch',{'id':beta['id']})
+                assert (await call(a,'rag3_fetch',{'id':alpha['id'],'collection':COLLECTIONS[0]}))['text']==fetched_a['text']
+                wrong_collection=await a.call_tool('rag3_fetch',{'id':beta['id'],'collection':COLLECTIONS[0]})
                 assert wrong_collection.is_error,wrong_collection
                 error=json.loads(wrong_collection.content[0].text)['error']
                 assert error['code']=='STALE_ID',error

@@ -75,14 +75,16 @@ async def main() -> None:
                                                         "document_id": document_id})
                 assert "Amber forest beta" in doc["chunks"][0]["content"], doc
                 hits = await call("rag3_search_advanced", {
-                    "query": "Amber forest beta", "semantic": False,
+                    "query": "Amber forest beta", "collections": [name], "semantic": False,
                     "bm25": True,
                     "rank_fusion": False, "top_k": 3,
                 })
                 assert hits["results"], hits
-                fetched = await call("rag3_fetch", {"id": hits["results"][0]["id"]})
+                fetched = await call("rag3_fetch", {"id": hits["results"][0]["id"],
+                                                   "collection": hits["results"][0]["collection"]})
                 assert "Amber forest beta" in fetched["text"], fetched
-                default_hits = await call("rag3_search", {"query": "Amber forest beta"})
+                default_hits = await call("rag3_search", {"query": "Amber forest beta",
+                                                          "collections": [name]})
                 assert default_hits["results"], default_hits
                 deleted = await call("rag3_delete_document", {
                     "collection": name, "document_id": document_id,

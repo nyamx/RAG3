@@ -28,16 +28,16 @@ codex plugin list --json
 
 The helper checks the live MCP endpoint before changing the plugin and leaves a user-disabled installation disabled. The Codex CLI must be installed and available. Open a new Codex task after installation, then ask it to list RAG3 collections. The local plugin does not connect ChatGPT on the web.
 
-### ChatGPT on the web
+### ChatGPT on the web and Android
 
-RAG3 was exercised from ChatGPT web through a custom MCP plugin and OpenAI Secure MCP Tunnel. The tunnel lets ChatGPT reach the private `http://127.0.0.1:8000/mcp` endpoint while RAG3 keeps running on your PC. ChatGPT web does not read the local Codex plugin manifest. This is a per-user setup, subject to ChatGPT workspace and Platform tunnel permissions.
+RAG3 was exercised from ChatGPT web and the Android app through a custom MCP plugin and OpenAI Secure MCP Tunnel. The tunnel lets ChatGPT reach the private `http://127.0.0.1:8000/mcp` endpoint while RAG3 keeps running on your PC. ChatGPT does not read the local Codex plugin manifest. This is a per-user setup, subject to ChatGPT workspace and Platform tunnel permissions.
 
 1. Complete the [Windows installation](install-windows.md), start the backend, and verify `http://127.0.0.1:8000/health` locally.
 2. Follow the [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) to create a tunnel associated with the ChatGPT workspace, install `tunnel-client` on the RAG3 PC, point its HTTP MCP profile to `http://127.0.0.1:8000/mcp`, run `tunnel-client doctor`, and keep the client running. Keep tunnel IDs and runtime keys out of this repository.
 3. In [ChatGPT Plugins](https://chatgpt.com/plugins), choose **Add custom MCP server** and **Tunnel** as the connection, select your tunnel, configure authentication, create and install the plugin. See the [official ChatGPT custom MCP guide](https://developers.openai.com/api/docs/guides/custom-mcp-server).
-4. Start a new ChatGPT web conversation, select the installed plugin with `@`, and first ask it to list your RAG3 collections. Then search a named collection. For a remote connection without a session ID, use `rag3_search_flexible(collection=...)` or configure a backend default collection; `rag3_select_collection` needs a session.
+4. Start a new ChatGPT conversation on the web or Android app, select the installed plugin with `@`, and first ask it to list your RAG3 collections. Every search call must pass `collections`, such as `["demo"]` or `["books", "notes"]`. Each search result includes its collection; pass that value to `rag3_fetch` with the result ID. Original-source and page calls also require `collection`.
 
-The repository's tunnel helper restores an existing local tunnel profile. It does not create another user's tunnel, key, or ChatGPT plugin. A local Codex plugin installation alone does not enable ChatGPT web access. Secure MCP Tunnel is for a private connection; publishing this GitHub source repository does not publish an MCP plugin to everyone.
+The repository's tunnel helper restores an existing local tunnel profile. It does not create another user's tunnel, key, or ChatGPT plugin. A local Codex plugin installation alone does not enable ChatGPT access. Secure MCP Tunnel is for a private connection; publishing this GitHub source repository does not publish an MCP plugin to everyone.
 
 **Original PDF delivery to the AI:** `rag3_get_source` can provide a download card or source URI, but this does not make the PDF a native attachment in the current ChatGPT conversation. In the [October 2026 file-handoff experiments](chatgpt-file-handoff.md), a PDF reached ChatGPT host storage and was downloaded back with a matching SHA-256, yet the AI could not read it by the returned `fileId`. Use `rag3_search`, `rag3_get_document`, and `rag3_fetch` for text, or `rag3_get_page` for a page image. This limitation concerns RAG3-to-ChatGPT delivery; the separate `rag3_ingest_file` tool ingests an input file into RAG3 when an MCP client supplies a valid file reference.
 

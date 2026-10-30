@@ -67,7 +67,7 @@ def build_retrieval_pipeline(
 def _point_to_hit(rank: int, point, retriever: str) -> dict:
     payload = dict(point.payload or {})
     meta = dict(payload.get("meta") or {})
-    return {
+    hit = {
         "rank": rank,
         "retriever": retriever,
         "score": float(point.score) if point.score is not None else None,
@@ -84,6 +84,14 @@ def _point_to_hit(rank: int, point, retriever: str) -> dict:
         "source_uri": meta.get("source_uri"),
         "content": payload.get("content") or "",
     }
+    for key in ("source_kind", "chatgpt_export_file", "chatgpt_conversation_id",
+                "chatgpt_conversation_title", "chatgpt_message_id",
+                "chatgpt_role", "chatgpt_turn_index", "chatgpt_message_chunk_index",
+                "chatgpt_message_created_at_ms", "chatgpt_conversation_created_at_ms",
+                "chatgpt_conversation_updated_at_ms", "chatgpt_model_slug"):
+        if key in meta:
+            hit[key] = meta[key]
+    return hit
 
 
 def _selected_methods(

@@ -131,10 +131,12 @@ async def main() -> None:
                          for doc in docs["documents"]}
                 assert pages["mcp-pause"] == (1, 1), pages
                 hits = await call("rag3_search_advanced", {"query": phrase,
+                    "collections": [collection],
                     "semantic": False, "bm25": True,
                     "rank_fusion": False, "top_k": 3})
                 assert hits["results"] and hits["results"][0]["page_start"] == 1, hits
-                fetched = await call("rag3_fetch", {"id": hits["results"][0]["id"]})
+                fetched = await call("rag3_fetch", {"id": hits["results"][0]["id"],
+                    "collection": hits["results"][0]["collection"]})
                 assert phrase in fetched["text"] and fetched["page_start"] == 1, fetched
 
                 cancel_job = await call("rag3_ingest_text", {"collection": collection,

@@ -12,17 +12,17 @@ These examples start after the [Windows installation](install-windows.md). Keep 
 
 This workflow keeps the documents and Qdrant index on the RAG3 PC. A search result is a retrieved chunk; check the source before treating it as a complete answer.
 
-## 2. Ask ChatGPT on the web about an indexed document
+## 2. Ask ChatGPT on the web or Android app about an indexed document
 
-First complete the [ChatGPT web MCP setup](usage.md#chatgpt-on-the-web). In a new chat, select your installed RAG3 plugin with `@`. A useful first request is:
+First complete the [ChatGPT MCP setup](usage.md#chatgpt-on-the-web-and-android). In a new chat, select your installed RAG3 plugin with `@`. A useful first request is:
 
 > Use my RAG3 plugin to list collections. Then search the `demo` collection for "What are the main findings?" Read the relevant result chunks before answering. Include document titles and PDF page ranges when the results provide them. If the retrieved text is insufficient, say what is missing.
 
-For a sessionless web connection, the client should pass the collection on each call. The following illustrates the core read flow; `<id from search>` is the unchanged ID returned by the search tool:
+Every client must pass one or more collections to search. The following illustrates the core read flow; `<id from search>` is the unchanged ID returned by the search tool:
 
 ```text
 rag3_list_collections({})
-rag3_search_flexible({"query":"What are the main findings?","collection":"demo","top_k":5})
+rag3_search_flexible({"query":"What are the main findings?","collections":["demo"],"top_k":5})
 rag3_fetch({"id":"<id from search>","offset":0,"collection":"demo"})
 ```
 

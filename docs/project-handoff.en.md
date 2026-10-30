@@ -4,7 +4,7 @@ Basis: repository code and public documentation as of October 26, 2026. Writing 
 
 ## 1. What the project delivers
 
-RAG3 ingests and indexes documents on a Windows PC, then makes the same collections searchable from a desktop UI, a local Codex MCP plugin, and a ChatGPT web MCP plugin. Where available, it retains PDF page ranges and the managed original so a retrieved passage can be checked against its source. ChatGPT web reaches the local MCP server through a Secure MCP Tunnel and a custom plugin configured for that user.
+RAG3 ingests and indexes documents on a Windows PC, then makes the same collections searchable from a desktop UI, a local Codex MCP plugin, and a ChatGPT MCP plugin used on the web and Android app. Where available, it retains PDF page ranges and the managed original so a retrieved passage can be checked against its source. ChatGPT reaches the local MCP server through a Secure MCP Tunnel and a custom plugin configured for that user.
 
 There is an important boundary between **giving the AI a whole original document as a conversation attachment** and **retrieving relevant indexed content for the AI**. The latter is the working RAG3 path. The former reached ChatGPT host file storage in experiments, but did not establish conversation attachment registration or direct model reading of the original PDF.
 
@@ -14,7 +14,7 @@ There is an important boundary between **giving the AI a whole original document
 Windows user
   ├─ PySide6 UI ── authenticated /api/v1/command ┐
   ├─ local Codex MCP ── /mcp ──────────────────────┤
-  └─ ChatGPT web ── Secure MCP Tunnel ─ /mcp ─────┤
+  └─ ChatGPT web/Android ── MCP Tunnel ─ /mcp ───┤
                                                   ▼
                                   shared HTTP/MCP backend (Python)
                                   ├─ SQLite job journal and scheduler
@@ -61,7 +61,7 @@ The 4 GiB GPU design avoids keeping the parser and embedding model loaded togeth
 ## 5. Retrieval and reading
 
 - [retrieval.py](../rag3/retrieval.py) optionally runs BGE-M3 dense and Qdrant native BM25 queries. Qdrant RRF fuses both methods; equal scores use point ID for stable ordering. Metadata filtering is applied during candidate retrieval.
-- The UI and MCP call the same retrieval path. MCP rag3_search_flexible accepts a collection, candidate count, and metadata filter per call, which matters for remote clients without a persistent session ID.
+- The UI and MCP call the same retrieval path. Every MCP search requires a nonempty `collections` array; `rag3_search_flexible` also accepts a per-collection candidate count and metadata filter. Hits include their collection, which must be passed to `rag3_fetch`.
 - [rag3-mcp-server.py](../scripts/rag3-mcp-server.py) formats hits with source information and chunk IDs. rag3_fetch reads one chunk by character offset. A search excerpt is not evidence that the full source was read.
 - [collections.py](../rag3/collections.py) lists collections/documents, reads and deletes documents, and corrects section metadata. Section updates default to a dry run and verify that the points belong to the requested document before writing.
 - [sources.py](../rag3/sources.py) resolves a collection/document ID to a managed original and verifies its path and hash. rag3_get_source provides user-facing original-download information; rag3_get_page renders a physical PDF page.
@@ -94,7 +94,7 @@ The 4 GiB GPU design avoids keeping the parser and embedding model loaded togeth
 | Login settings | data/backend-login-config.json contains non-secret port, Qdrant address, and backend-wide write/delete policy. |
 | Tunnel credentials | User-specific local saved profile; never put them in the repository, documentation, or logs. |
 
-The HTTP server binds to 127.0.0.1 by default. The UI command API uses a backend-issued X-RAG3-Token, rotated on backend restart. MCP does not use that UI token. RAG3_MCP_WRITE_ENABLED and RAG3_MCP_DELETE_ENABLED control write/delete permission for the **whole backend**. In a manual server launch, the code defaults both to allowed, so explicitly review the policy before connecting a remote client. Sessionless MCP clients should pass the collection on each call; do not assume one user's selection carries to another. Compose currently publishes Qdrant ports without a host-IP restriction, so inspect network exposure separately.
+The HTTP server binds to 127.0.0.1 by default. The UI command API uses a backend-issued X-RAG3-Token, rotated on backend restart. MCP does not use that UI token. RAG3_MCP_WRITE_ENABLED and RAG3_MCP_DELETE_ENABLED control write/delete permission for the **whole backend**. In a manual server launch, the code defaults both to allowed, so explicitly review the policy before connecting a remote client. Legacy collection selection is process-wide for sessionless MCP connections, but search and source calls ignore that selection and require explicit collection names. Compose currently publishes Qdrant ports without a host-IP restriction, so inspect network exposure separately.
 
 ## 8. Startup, verification, and transfer sequence
 
