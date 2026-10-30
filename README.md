@@ -21,9 +21,23 @@ Desktop UI searching a local SciFact collection with BGE-M3 semantic search, BM2
 
 ![RAG3 desktop retrieval UI showing three search results](docs/images/rag3-desktop-search.jpg)
 
-ChatGPT Android app using the RAG3 MCP plugin to search a ChatGPT history collection:
+ChatGPT Android app using the RAG3 MCP plugin to search a ChatGPT history collection. The four captures below show the request and the resulting answer in order:
 
-<img src="docs/images/rag3-chatgpt-android.jpg" alt="ChatGPT Android app using the RAG3 MCP plugin" width="300">
+**1. RAG3 search request**
+
+![ChatGPT Android app calling the RAG3 MCP plugin](docs/images/rag3-chatgpt-android.jpg)
+
+**2. Search method and result summary**
+
+![RAG3 search method and result summary in ChatGPT Android](docs/images/rag3-chatgpt-android-results-01.jpg)
+
+**3. Retrieved conversation list**
+
+![Conversation search results returned through RAG3 in ChatGPT Android](docs/images/rag3-chatgpt-android-results-02.jpg)
+
+**4. Relevant conversation details**
+
+![Details of a relevant retrieved conversation in ChatGPT Android](docs/images/rag3-chatgpt-android-results-03.jpg)
 
 ## Try it
 
