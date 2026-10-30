@@ -21,7 +21,7 @@ Desktop UI searching a local SciFact collection with BGE-M3 semantic search, BM2
 
 ![RAG3 desktop retrieval UI showing three search results](docs/images/rag3-desktop-search.jpg)
 
-User-provided capture of the ChatGPT Android app invoking the RAG3 MCP plugin to search a ChatGPT history collection:
+ChatGPT Android app using the RAG3 MCP plugin to search a ChatGPT history collection:
 
 <img src="docs/images/rag3-chatgpt-android.jpg" alt="ChatGPT Android app using the RAG3 MCP plugin" width="300">
 
